@@ -215,8 +215,9 @@ cat <<'EOF'
   }}'
 
   # Option B — keep the heap, give the container room (watch node capacity)
+  #   size the container from the heap: 1920m heap -> 2560Mi (75%), not 2Gi (94%)
   kubectl -n mirage patch kafkaconnect mirage --type merge -p '{"spec":{
-    "resources":{"requests":{"cpu":"250m","memory":"2Gi"},"limits":{"memory":"2Gi"}}
+    "resources":{"requests":{"cpu":"250m","memory":"2560Mi"},"limits":{"memory":"2560Mi"}}
   }}'
 
   # Either way, also reduce what the connector buffers:

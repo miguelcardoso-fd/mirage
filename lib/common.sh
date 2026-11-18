@@ -813,9 +813,22 @@ recreate_connect_cluster() {
   kq delete kafkaconnector --all --wait=true >/dev/null 2>&1
   kq delete kafkaconnect "$CONNECT" --wait=true >/dev/null 2>&1
   kq delete pod -l "strimzi.io/cluster=$CONNECT" --force --grace-period=0 >/dev/null 2>&1
-  sleep 8
+  # A reconcile still rolling the deleted cluster (lab 12: a crashing heap)
+  # keeps the per-resource lock for up to 5 min per pod: the re-created CR's
+  # ADDED event is skipped, and the old reconcile brings a worker back after
+  # the topic deletes below, so the broker AUTO-creates mirage-connect-offsets
+  # with cleanup.policy=delete and the new worker crashloops on it forever.
+  # Restarting the operator drops the in-flight reconcile.
+  k rollout restart deploy/"$OPERATOR_DEPLOY" >/dev/null 2>&1
+  k rollout status deploy/"$OPERATOR_DEPLOY" --timeout=180s >/dev/null 2>&1
+  local pod t n=0
+  while [ "$n" -lt 120 ]; do
+    [ -z "$(kq get pod -l "strimzi.io/cluster=$CONNECT" -o name 2>/dev/null)" ] && break
+    kq delete pod -l "strimzi.io/cluster=$CONNECT" --force --grace-period=0 >/dev/null 2>&1
+    sleep 4; n=$((n+4))
+  done
+  sleep 4
 
-  local pod t n
   pod="$(tgt_pod)"
   if [ -n "$pod" ]; then
     for t in mirage-connect-configs mirage-connect-status mirage-connect-offsets; do
@@ -827,7 +840,9 @@ recreate_connect_cluster() {
     # partitions 1-4 while reporting its tasks as RUNNING.
     n=0
     while [ "$n" -lt 60 ]; do
-      topic_exists "$pod" "$TGT_BOOT" mirage-connect-status || break
+      topic_exists "$pod" "$TGT_BOOT" mirage-connect-status \
+        || topic_exists "$pod" "$TGT_BOOT" mirage-connect-offsets \
+        || topic_exists "$pod" "$TGT_BOOT" mirage-connect-configs || break
       sleep 3; n=$((n+3))
     done
   fi
@@ -848,6 +863,23 @@ recreate_connect_cluster() {
       _kafka_in "$pod" "bin/kafka-topics.sh --bootstrap-server $TGT_BOOT --delete --topic mirage-connect-status" >/dev/null 2>&1
       sleep 15
       kubectl apply -f "$LAB_HOME/manifests/connect.yaml" >/dev/null 2>&1
+      kq wait kafkaconnect/"$CONNECT" --for=condition=Ready --timeout=420s >/dev/null 2>&1
+    fi
+    # Same trap, other symptom: an auto-created topic has the broker default
+    # cleanup.policy=delete, and the worker refuses to start on it ("required
+    # to have 'cleanup.policy=compact'") and crashloops. Repair it in place.
+    local fixed=0
+    for t in mirage-connect-configs mirage-connect-status mirage-connect-offsets; do
+      topic_exists "$pod" "$TGT_BOOT" "$t" || continue
+      _kafka_in "$pod" "bin/kafka-configs.sh --bootstrap-server $TGT_BOOT --describe --entity-type topics --entity-name $t" \
+        | grep -q 'cleanup.policy=compact' && continue
+      warn "$t came back with cleanup.policy=delete; setting compact"
+      _kafka_in "$pod" "bin/kafka-configs.sh --bootstrap-server $TGT_BOOT --alter --entity-type topics --entity-name $t --add-config cleanup.policy=compact" >/dev/null 2>&1
+      fixed=1
+    done
+    if [ "$fixed" = 1 ]; then
+      kq delete pod -l "strimzi.io/cluster=$CONNECT" >/dev/null 2>&1
+      sleep 10
       kq wait kafkaconnect/"$CONNECT" --for=condition=Ready --timeout=420s >/dev/null 2>&1
     fi
   fi

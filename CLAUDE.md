@@ -453,6 +453,15 @@ it was gone, and the failure never reproduced.
   just totals. Target offsets advancing is not proof a partition is replicating.
 - **Cleanup ordering.** Anything deleted while a producer runs is recreated. Stop *every*
   connector first — the baseline mirror emits heartbeats too, not just the injected loop.
+- **Rebuilding Connect while the operator is still rolling it.** Lab 12's bad heap makes
+  every new pod crash, and the operator waits ~5 min per pod for readiness while holding the
+  resource's lock. A `recreate_connect_cluster` in that window had its ADDED event skipped,
+  the old reconcile brought a worker back after the topic deletes, and the broker
+  AUTO-created `mirage-connect-offsets` with `cleanup.policy=delete`. The new worker then
+  crashlooped on `required to have 'cleanup.policy=compact'` and the lab could not pass
+  (47 min, 0 tasks). The rebuild now restarts the operator, waits for every Connect pod to
+  be gone before deleting topics, and repairs any internal topic that comes back without
+  `compact`. Also: a stale `Ready=True` on the CR does not mean the new spec rolled out.
 - **A connector's config outlives the connector.** Connect's `config.storage.topic` is
   compacted and replayed on worker start, so a deleted loop connector keeps recreating
   `mm2-offset-syncs.<alias>.internal`. Only `recreate_connect_cluster` clears it.

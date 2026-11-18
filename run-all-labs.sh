@@ -497,7 +497,7 @@ fix_18() {
 
 fix_3_b() {    # Option B: keep the heap, give the container room
   k patch kafkaconnect "$CONNECT" --type merge -p '{"spec":{
-    "resources":{"requests":{"cpu":"250m","memory":"2Gi"},"limits":{"memory":"2Gi"}}}}' >/dev/null 2>&1
+    "resources":{"requests":{"cpu":"250m","memory":"2560Mi"},"limits":{"memory":"2560Mi"}}}}' >/dev/null 2>&1
   patch_conn '{"spec":{"config":{
     "consumer.max.poll.records":"500","consumer.fetch.max.bytes":"52428800",
     "consumer.max.partition.fetch.bytes":"1048576",
