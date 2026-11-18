@@ -1,0 +1,73 @@
+---
+# Users for the connector auth / authorization labs.
+#
+# Strimzi creates a Secret per user holding the SCRAM password, which the labs
+# mount into Connect. These only matter on the `scram` listener (:9094); the
+# plaintext listener used by every other lab is unaffected.
+
+# Fully-privileged replication user. The "correct credentials" case.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: kcd-replicator
+  namespace: mirage
+  labels:
+    strimzi.io/cluster: kafka-target
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      # Write the replicated topics.
+      - resource:
+          type: topic
+          name: "*"
+          patternType: literal
+        operations: [Write, Create, Describe, DescribeConfigs, Read]
+        host: "*"
+      # MirrorMaker2 needs group access for its consumers.
+      - resource:
+          type: group
+          name: "*"
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      # Cluster-level describe + topic creation.
+      - resource:
+          type: cluster
+        operations: [Describe, DescribeConfigs, Create, Alter, AlterConfigs]
+        host: "*"
+---
+# Deliberately under-privileged user: can authenticate, can describe, but
+# CANNOT write. Produces an authorization failure that looks nothing like an
+# authentication failure — which is the whole lesson of the ACL lab.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaUser
+metadata:
+  name: kcd-readonly
+  namespace: mirage
+  labels:
+    strimzi.io/cluster: kafka-target
+spec:
+  authentication:
+    type: scram-sha-512
+  authorization:
+    type: simple
+    acls:
+      - resource:
+          type: topic
+          name: "*"
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: group
+          name: "*"
+          patternType: literal
+        operations: [Read, Describe]
+        host: "*"
+      - resource:
+          type: cluster
+        operations: [Describe]
+        host: "*"

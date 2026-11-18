@@ -1,0 +1,192 @@
+---
+# JMX Prometheus exporter rules, trimmed from the real KCD chart so the lab
+# emits the same metric NAMES you will see in Datadog.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: connect-jmx-config
+  namespace: mirage
+data:
+  jmx-config.yaml: |
+    lowercaseOutputName: true
+    rules:
+      # Per-task commit health and running ratio.
+      - pattern: 'kafka.connect<type=connector-task-metrics, connector=(.+), task=(.+)><>(offset-commit-avg-time-ms|offset-commit-success-percentage|running-ratio)'
+        name: kafka_connect_connector_task_$3
+        type: GAUGE
+        labels:
+          connector: "$1"
+          task: "$2"
+      # Task counts by state, from the worker view.
+      - pattern: 'kafka.connect<type=connect-worker-metrics, connector=(.+)><>(connector-destroyed-task-count|connector-failed-task-count|connector-paused-task-count|connector-running-task-count|connector-total-task-count|connector-unassigned-task-count)'
+        name: kafka_connect_worker_$2
+        type: GAUGE
+        labels:
+          connector: "$1"
+      # Same metric names from the connector view (both rules exist in prod).
+      - pattern: 'kafka.connect<type=connector-metrics, connector=(.+)><>(connector-destroyed-task-count|connector-failed-task-count|connector-paused-task-count|connector-running-task-count|connector-total-task-count|connector-unassigned-task-count)'
+        name: kafka_connect_worker_$2
+        type: GAUGE
+        labels:
+          connector: "$1"
+      # Connector status as a numeric gauge, matching AbstractStatus.State ordinals.
+      - pattern: 'kafka.connect<type=connector-metrics, connector=(.+)><>status: unassigned'
+        name: kafka_connect_connector_status
+        value: 0
+        labels:
+          connector: "$1"
+      - pattern: 'kafka.connect<type=connector-metrics, connector=(.+)><>status: running'
+        name: kafka_connect_connector_status
+        value: 1
+        labels:
+          connector: "$1"
+      - pattern: 'kafka.connect<type=connector-metrics, connector=(.+)><>status: paused'
+        name: kafka_connect_connector_status
+        value: 2
+        labels:
+          connector: "$1"
+      - pattern: 'kafka.connect<type=connector-metrics, connector=(.+)><>status: failed'
+        name: kafka_connect_connector_status
+        value: 3
+        labels:
+          connector: "$1"
+      - pattern: 'kafka.connect<type=connector-metrics, connector=(.+)><>status: destroyed'
+        name: kafka_connect_connector_status
+        value: 4
+        labels:
+          connector: "$1"
+      - pattern: 'kafka.connect<type=connector-metrics, connector=(.+)><>status: restarting'
+        name: kafka_connect_connector_status
+        value: 5
+        labels:
+          connector: "$1"
+      - pattern: 'kafka.connect<type=connector-metrics, connector=(.+)><>status: stopped'
+        name: kafka_connect_connector_status
+        value: 6
+        labels:
+          connector: "$1"
+      # Worker-level counts.
+      - pattern: 'kafka.connect<type=connect-worker-metrics><>([a-z-]+)'
+        name: kafka_connect_worker_$1
+        type: GAUGE
+      # Rebalance family — note rebalance_epoch, the loop detector.
+      - pattern: 'kafka.connect<type=connect-worker-rebalance-metrics><>(completed-rebalances-total|epoch|rebalance-avg-time-ms|rebalance-max-time-ms|rebalancing|time-since-last-rebalance-ms)'
+        name: kafka_connect_worker_rebalance_$1
+        type: GAUGE
+      # Mirror replication. The (?!-) lookaheads stop base attributes from also
+      # matching their -avg/-max/-min supersets (a real cardinality incident).
+      - pattern: 'kafka.connect.mirror<type=MirrorSourceConnector, target=(.+), topic=(.+), partition=(.+)><>(record-count|record-rate|byte-count|byte-rate)'
+        name: kafka_connect_mirror_replication_$4
+        type: GAUGE
+        labels:
+          target: "$1"
+          topic: "$2"
+          partition: "$3"
+      - pattern: 'kafka.connect.mirror<type=MirrorSourceConnector, target=(.+), topic=(.+), partition=(.+)><>(replication-latency-ms|record-age-ms)(?!-)'
+        name: kafka_connect_mirror_replication_$4
+        type: GAUGE
+        labels:
+          target: "$1"
+          topic: "$2"
+          partition: "$3"
+      # Consumer lag.
+      - pattern: 'kafka.consumer<type=consumer-fetch-manager-metrics, client-id=(.+)><>records-lag-max'
+        name: kafka_consumer_fetch_records_lag_max
+        type: GAUGE
+        labels:
+          client_id: "$1"
+      # Producer error rate — target-side rejection.
+      - pattern: 'kafka.producer<type=producer-topic-metrics, client-id=(.+), topic=(.+)><>(record-send-rate|record-error-rate)'
+        name: kafka_producer_topic_$3
+        type: GAUGE
+        labels:
+          client_id: "$1"
+          topic: "$2"
+      # Task error totals.
+      - pattern: 'kafka.connect<type=task-error-metrics, connector=(.+), task=(.+)><>(total-record-errors|total-record-failures|total-retries)'
+        name: kafka_connect_task_error_$3
+        type: GAUGE
+        labels:
+          connector: "$1"
+          task: "$2"
+---
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnect
+metadata:
+  name: mirage
+  namespace: mirage
+  annotations:
+    # Force-merged in the real chart; cannot be disabled from values.
+    strimzi.io/use-connector-resources: "true"
+spec:
+  version: 4.0.0
+  replicas: 1
+  bootstrapServers: kafka-target-kafka-bootstrap:9092
+  config:
+    # Stateful. Changing any of these four orphans connector state.
+    group.id: connect-cluster_mirage
+    config.storage.topic: mirage-connect-configs
+    offset.storage.topic: mirage-connect-offsets
+    status.storage.topic: mirage-connect-status
+    config.storage.replication.factor: 1
+    offset.storage.replication.factor: 1
+    status.storage.replication.factor: 1
+    # Production uses 25; reduced for the lab so a single small broker
+    # can be read to the end before the liveness probe fires.
+    offset.storage.partitions: 5
+    offset.flush.interval.ms: 10000
+    connector.client.config.override.policy: All
+    # 300000 on K8s vs 0 on the legacy VMs — the key cloud-native delta.
+    scheduled.rebalance.max.delay.ms: 300000
+    # Worker-level JSON converters; connectors override to ByteArray.
+    key.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    key.converter.schemas.enable: true
+    value.converter.schemas.enable: true
+  jvmOptions:
+    gcLoggingEnabled: false
+    "-Xms": "768m"
+    "-Xmx": "768m"
+    "-XX":
+      # Worker-side OOM defence. Pairs with autoRestart on the connector.
+      ExitOnOutOfMemoryError: "true"
+  resources:
+    requests:
+      cpu: "250m"
+      memory: 1280Mi
+    limits:
+      memory: 1280Mi
+  readinessProbe:
+    initialDelaySeconds: 45
+    timeoutSeconds: 15
+    periodSeconds: 15
+    failureThreshold: 10
+  livenessProbe:
+    initialDelaySeconds: 240
+    timeoutSeconds: 20
+    periodSeconds: 30
+    failureThreshold: 8
+  metricsConfig:
+    type: jmxPrometheusExporter
+    valueFrom:
+      configMapKeyRef:
+        name: connect-jmx-config
+        key: jmx-config.yaml
+  # Mount the target cluster's CA as a plain volume so CONNECTORS can trust its
+  # TLS listener (:9094) for the auth labs.
+  #
+  # Deliberately NOT spec.tls.trustedCertificates: that switches the WORKER
+  # itself to TLS, and the worker bootstraps against the plaintext :9092
+  # listener — it then times out on listNodes and crashloops with
+  # "Failed to connect to and describe Kafka cluster".
+  template:
+    pod:
+      volumes:
+        - name: target-ca
+          secret:
+            secretName: kafka-target-cluster-ca-cert
+    connectContainer:
+      volumeMounts:
+        - name: target-ca
+          mountPath: /mnt/target-ca
+          readOnly: true

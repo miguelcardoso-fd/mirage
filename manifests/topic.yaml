@@ -1,0 +1,12 @@
+---
+# 12 partitions: the parallelism ceiling that Lab 1 teaches.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaTopic
+metadata:
+  name: lab-orders
+  namespace: mirage
+  labels:
+    strimzi.io/cluster: kafka-source
+spec:
+  partitions: 12
+  replicas: 1

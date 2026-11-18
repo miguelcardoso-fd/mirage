@@ -1,0 +1,88 @@
+---
+# Host-routed Ingress for the Connect REST API, shaped like the real KCD one.
+#
+# In production the REST API is reached through an internal ingress whose
+# backend is the Service `kcd-service-connect-api` on its named port
+# `rest-api`, at a host like `kcd-<vertical>-<dc>.<env>.<region>.sb.fndlint.net`.
+# Strimzi names the equivalent Service here `mirage-connect-api` and gives it
+# the same named port, so this is a direct analogue rather than an approximation.
+#
+# The host is deliberately a name that does not resolve. mirage reaches the
+# ingress controller with `kubectl port-forward` and supplies the host in a
+# header:
+#
+#   curl -H 'Host: mirage.local' localhost:8080/connectors
+#
+# That keeps the Host-header routing prod uses without touching /etc/hosts
+# (which needs sudo) or depending on a public wildcard-DNS service.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: mirage-connect-api
+  namespace: mirage
+  labels:
+    app.kubernetes.io/part-of: mirage
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: mirage.local
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: mirage-connect-api
+                port:
+                  name: rest-api
+---
+# Without this the ingress answers 504 and nothing explains why.
+#
+# Strimzi auto-generates a NetworkPolicy (`mirage-connect`) on the Connect pods
+# admitting port 8083 from exactly two peers: other pods of the same Connect
+# cluster, and the cluster operator. The ingress controller runs in the
+# `ingress-nginx` namespace and matches neither, so nginx's upstream TCP connect
+# never completes:
+#
+#   upstream timed out (110: Operation timed out) while connecting to upstream,
+#   server: mirage.local, upstream: "http://10.244.0.11:8083/connectors"
+#
+# Meanwhile the API answers 200 from inside the pod and from its own Service, so
+# every backend signal looks healthy — the shape of incident that sends people
+# to look at Connect rather than at the policy.
+#
+# Verified on this cluster: deleting `mirage-connect` makes the request return
+# 200, and the operator recreates it ~3s later, at which point the timeout
+# returns. kindnet DOES enforce NetworkPolicy, despite the common claim that it
+# does not.
+#
+# NetworkPolicies are additive — the union of every policy selecting a pod — so
+# this grants the one extra peer without editing Strimzi's policy. It has to be
+# a separate object: the operator owns `mirage-connect` via an ownerReference to
+# the KafkaConnect CR, reverts edits to it, and deletes it when the CR goes.
+# An unowned policy also survives `recreate_connect_cluster`.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: mirage-connect-api-from-ingress
+  namespace: mirage
+  labels:
+    app.kubernetes.io/part-of: mirage
+spec:
+  podSelector:
+    matchLabels:
+      strimzi.io/cluster: mirage
+      strimzi.io/kind: KafkaConnect
+      strimzi.io/name: mirage-connect
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # kubernetes.io/metadata.name is set automatically on every namespace by
+        # the API server, so this needs no labelling of our own.
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8083
+          protocol: TCP

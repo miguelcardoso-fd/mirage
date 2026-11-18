@@ -1,0 +1,1768 @@
+#!/usr/bin/env bash
+# mirage — local Kafka Connect incident-response trainer (KCD / Strimzi).
+#
+#   mirage setup          create the cluster + Strimzi + Kafka + Connect + ingress
+#   mirage list           show all labs and your results
+#   mirage start <n>      inject lab n's fault(s)
+#   mirage stop <n>       grade your fix
+#   mirage hint <n>       nudge
+#   mirage solve <n>      full answer
+#   mirage status         current cluster + lab state
+#   mirage counts         source vs target record counts
+#   mirage topics         topics on both clusters
+#   mirage logs           tail a Connect worker
+#   mirage metrics [pat]  scrape the JMX exporter
+#   mirage answer <n> <v> record a triage conclusion (labs that ask for one)
+#   mirage reset          restore the baseline without re-creating the cluster
+#   mirage teardown       delete the cluster
+
+set -uo pipefail
+
+# Resolve symlinks before deriving LAB_HOME. If this script is reached through a
+# symlink (e.g. /usr/local/bin/mirage -> .../mirage/mirage), dirname gives
+# the SYMLINK's directory, and lib/, labs/ and manifests/ are not there.
+# readlink -f is GNU-only, so walk the links by hand for macOS.
+_kcd_self="${BASH_SOURCE[0]}"
+while [ -L "$_kcd_self" ]; do
+  _kcd_link="$(readlink "$_kcd_self")"
+  case "$_kcd_link" in
+    /*) _kcd_self="$_kcd_link" ;;                                   # absolute
+    *)  _kcd_self="$(dirname "$_kcd_self")/$_kcd_link" ;;           # relative
+  esac
+done
+LAB_HOME="$(cd "$(dirname "$_kcd_self")" && pwd)"
+unset _kcd_self _kcd_link
+# kind/minikube may be installed in ~/.local/bin rather than a brew prefix.
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) PATH="$HOME/.local/bin:$PATH" ;; esac
+export PATH
+# shellcheck source=lib/common.sh
+source "$LAB_HOME/lib/common.sh"
+
+# The cluster name lives in lib/provider.sh as LAB_CLUSTER, so both the
+# provider verbs and the commands here agree on it.
+STRIMZI_VERSION=0.47.0
+INGRESS_NGINX_VERSION=1.11.3
+
+# ---------------------------------------------------------------- lab registry
+
+lab_file() {
+  local n="$1"
+  local f
+  f="$(find "$LAB_HOME/labs" -name "$(printf '%02d' "$n")-*.sh" -maxdepth 1 2>/dev/null | head -1)"
+  [ -n "$f" ] && printf '%s' "$f"
+}
+
+load_lab() {
+  local n="$1" f
+  f="$(lab_file "$n")"
+  if [ -z "$f" ]; then err "No such lab: $n (try: mirage list)"; exit 1; fi
+  unset -f lab_brief lab_break lab_check lab_hint lab_solve 2>/dev/null
+  LAB_TITLE=""; LAB_DIFFICULTY=""; LAB_ALERT=""
+  # shellcheck disable=SC1090
+  source "$f"
+}
+
+all_lab_numbers() {
+  find "$LAB_HOME/labs" -maxdepth 1 -name '[0-9][0-9]-*.sh' 2>/dev/null \
+    | sed 's#.*/##; s/^0*//; s/-.*//' | sort -n
+}
+
+# ---------------------------------------------------------------------- setup
+
+cmd_setup() {
+  hr
+  say "${C_B}Mirage environment setup${C_0}"
+  hr
+
+  local provider
+  if ! provider="$(provider_detect)"; then
+    err "No cluster provider found. Install one:"
+    say "    brew install kind         # or"
+    say "    brew install minikube"
+    say ""
+    say "  Pick explicitly with: MIRAGE_PROVIDER=minikube ./mirage setup"
+    exit 1
+  fi
+  case "$provider" in
+    kind|minikube) ;;
+    *) err "Unknown MIRAGE_PROVIDER '$provider' (expected: kind | minikube)"; exit 1 ;;
+  esac
+  say "  ${C_GRN}ok${C_0}      provider: ${C_B}$provider${C_0} ${C_DIM}(override with MIRAGE_PROVIDER)${C_0}"
+
+  local missing=()
+  for bin in docker "$(provider_binary "$provider")" kubectl; do
+    if command -v "$bin" >/dev/null 2>&1; then
+      say "  ${C_GRN}found${C_0}   $bin"
+    else
+      say "  ${C_RED}missing${C_0} $bin"
+      missing+=("$bin")
+    fi
+  done
+
+  if [ "${#missing[@]}" -gt 0 ]; then
+    say ""
+    err "Install the missing tool(s) first:"
+    local brews=() casks=()
+    for m in "${missing[@]}"; do
+      case "$m" in
+        docker) casks+=("docker") ;;
+        *)      brews+=("$m") ;;
+      esac
+    done
+    [ "${#brews[@]}" -gt 0 ] && say "    brew install ${brews[*]}"
+    [ "${#casks[@]}" -gt 0 ] && say "    brew install --cask ${casks[*]}     # or Rancher Desktop"
+    exit 1
+  fi
+
+  if ! docker info >/dev/null 2>&1; then
+    say ""
+    err "Docker is not reachable."
+    say "  If you use Docker Desktop:   open -a Docker"
+    say "  If you use Rancher Desktop:  start the app"
+    say "  If you use colima:           colima start --cpu 8 --memory 16"
+    say ""
+    say "  Already running? Your docker context may point at a socket that does"
+    say "  not exist — common with colima, whose socket is not /var/run/docker.sock."
+    say ""
+    say "    docker context ls            # find the one whose endpoint exists"
+    say "    docker context use colima    # then select it"
+    say ""
+    say "  ${C_DIM}minikube and kind both read the active context, so this must be"
+    say "  right before either can create a cluster.${C_0}"
+    exit 1
+  fi
+  say "  ${C_GRN}ok${C_0}      docker daemon responding"
+
+  # The labs need ~6GB of VM memory for two Kafka clusters plus Connect.
+  local dmem
+  dmem="$(docker info --format '{{.MemTotal}}' 2>/dev/null)"
+  if [ -n "$dmem" ] && [ "$dmem" -gt 0 ] 2>/dev/null; then
+    local dmem_gb=$(( dmem / 1024 / 1024 / 1024 ))
+    if [ "$dmem_gb" -lt 5 ]; then
+      warn "Docker has only ~${dmem_gb}GB of memory; the labs want 6GB+."
+      warn "Kafka or Connect may be OOMKilled. Raise it in your Docker/colima settings."
+    else
+      say "  ${C_GRN}ok${C_0}      docker memory ~${dmem_gb}GB"
+    fi
+  fi
+  say ""
+
+  if provider_cluster_exists "$provider"; then
+    info "$provider cluster '$LAB_CLUSTER' already exists — reusing it"
+    provider_export_kubeconfig "$provider"
+  else
+    info "Creating $provider cluster '$LAB_CLUSTER' (a few minutes)"
+    provider_create "$provider" || {
+      err "$provider cluster creation failed"; exit 1; }
+    provider_export_kubeconfig "$provider"
+  fi
+  # Record which provider owns this cluster, so a later teardown/repair in a
+  # different shell acts on the right one even if detection would now differ.
+  provider_save "$provider"
+
+  info "Creating namespace '$NS'"
+  kubectl create namespace "$NS" >/dev/null 2>&1 || true
+
+  # Pin the namespace into the kubeconfig itself, so raw kubectl against this
+  # cluster does not need -n mirage on every command. A child process cannot
+  # change the parent shell's environment, but it CAN write this file — and the
+  # setting then applies to anyone who exports KUBECONFIG.
+  kubectl config set-context --current --namespace="$NS" >/dev/null 2>&1 || true
+
+  info "Installing Strimzi operator $STRIMZI_VERSION (vendored, no network needed)"
+  if [ -d "$LAB_HOME/vendor/strimzi-$STRIMZI_VERSION" ]; then
+    kubectl apply -f "$LAB_HOME/vendor/strimzi-$STRIMZI_VERSION/" -n "$NS" >/dev/null || {
+      err "Strimzi install failed"; exit 1; }
+  else
+    warn "vendored manifests missing; falling back to strimzi.io"
+    kubectl apply -f "https://strimzi.io/install/$STRIMZI_VERSION?namespace=$NS" -n "$NS" >/dev/null || {
+      err "Strimzi install failed — check network access to strimzi.io"; exit 1; }
+  fi
+
+  spin_until 300 "waiting for the Strimzi operator" \
+    bash -c "kubectl -n $NS get deploy strimzi-cluster-operator -o jsonpath='{.status.readyReplicas}' 2>/dev/null | grep -q '^[1-9]'"
+
+  info "Installing ingress-nginx $INGRESS_NGINX_VERSION (vendored)"
+  # No -n here: this manifest carries its own `ingress-nginx` namespace, and
+  # kubectl rejects -n when it disagrees with an explicit namespace in the file.
+  # Applied before Kafka so the controller pulls and starts while the brokers
+  # are coming up.
+  if [ -f "$LAB_HOME/vendor/ingress-nginx-$INGRESS_NGINX_VERSION/deploy.yaml" ]; then
+    kubectl apply -f "$LAB_HOME/vendor/ingress-nginx-$INGRESS_NGINX_VERSION/deploy.yaml" >/dev/null || {
+      warn "ingress-nginx install failed; the REST API will be unreachable from the host"; }
+  else
+    warn "vendored ingress-nginx manifest missing; the REST API will not be exposed"
+  fi
+
+  info "Deploying source and target Kafka clusters (Kafka 4.0.0, KRaft)"
+  kubectl apply -f "$LAB_HOME/manifests/kafka.yaml" >/dev/null
+
+  info "Waiting for Kafka clusters (up to 10 minutes on first run)"
+  k wait kafka/kafka-source --for=condition=Ready --timeout=600s || {
+    err "kafka-source did not become Ready"
+    say "  kubectl -n $NS get pods"
+    exit 1; }
+  k wait kafka/kafka-target --for=condition=Ready --timeout=600s || {
+    err "kafka-target did not become Ready"; exit 1; }
+
+  info "Creating the source topic (12 partitions)"
+  kubectl apply -f "$LAB_HOME/manifests/topic.yaml" >/dev/null
+
+  info "Creating the SCRAM users for the security labs"
+  kubectl apply -f "$LAB_HOME/manifests/users.yaml" >/dev/null
+  # The user operator writes a Secret per KafkaUser; labs 13-15 read the
+  # password out of it, so wait for them to exist.
+  spin_until 240 "waiting for user secrets" \
+    bash -c "kubectl -n $NS get secret kcd-replicator kcd-readonly >/dev/null 2>&1"
+
+  info "Deploying the Connect cluster"
+  kubectl apply -f "$LAB_HOME/manifests/connect.yaml" >/dev/null
+  k wait kafkaconnect/"$CONNECT" --for=condition=Ready --timeout=600s || {
+    err "KafkaConnect did not become Ready"
+    say "  kubectl -n $NS get pods"
+    say "  kubectl -n $NS describe kafkaconnect $CONNECT"
+    exit 1; }
+
+  info "Creating the baseline mirror connector"
+  kubectl apply -f "$LAB_HOME/manifests/connector.yaml" >/dev/null
+  wait_connector_tasks 1 180 || warn "connector tasks slow to appear; continuing"
+
+  info "Exposing the Connect REST API through the ingress"
+  if api_wait_controller 180; then
+    # Applied only once the controller and its IngressClass exist; an Ingress
+    # created before them is accepted but never routed.
+    kubectl apply -f "$LAB_HOME/manifests/ingress.yaml" >/dev/null || \
+      warn "Ingress apply failed"
+    if api_start; then
+      say "  ${C_GRN}ok${C_0}      $(api_curl_example)"
+    else
+      warn "ingress is up but the port-forward did not come alive; run: mirage api"
+    fi
+  else
+    warn "ingress-nginx controller not ready; REST API not exposed. Retry with: mirage api"
+  fi
+
+  # Expose a broker on localhost:9092 so the host's own Kafka CLI works. The
+  # /etc/hosts half needs root, so report what is still missing rather than
+  # claiming it is usable.
+  info "Exposing the source broker for host Kafka CLI tools"
+  if kafka_pf_start source; then
+    if kafka_hosts_entry_ok source; then
+      say "  ${C_GRN}ok${C_0}      kafka-topics --bootstrap-server localhost:$KAFKA_PORT --list"
+    else
+      warn "forwarded, but add this once (needs sudo) or clients cannot follow the redirect:"
+      say "    ${C_B}echo '127.0.0.1 $(kafka_advertised_host source)' | sudo tee -a /etc/hosts${C_0}"
+    fi
+  else
+    warn "could not forward the Kafka broker; run: mirage kafka"
+  fi
+
+  info "Smoke test: producing 2000 records and checking they replicate"
+  produce 2000 1000 2000
+  local n=0 tgt=0
+  while [ "$n" -lt 120 ]; do
+    tgt="$(tgt_count)"
+    [ "${tgt:-0}" -ge 1500 ] && break
+    sleep 5; n=$((n+5))
+  done
+
+  say ""
+  hr
+  if [ "${tgt:-0}" -ge 1500 ]; then
+    say "${C_GRN}${C_B}  Environment ready.  ${C_0}"
+    say "  source=$(src_count)  target=$tgt"
+  else
+    warn "Smoke test inconclusive (target=$tgt). Inspect with: mirage status"
+  fi
+  hr
+  say ""
+  say "${C_B}Point this shell at the lab cluster${C_0} ${C_DIM}(for raw kubectl)${C_0}"
+  say ""
+  say "  ${C_B}eval \"\$(./mirage env --export)\"${C_0}"
+  say ""
+  say "${C_DIM}Namespace '$NS' is already pinned in that kubeconfig, so plain"
+  say "'kubectl get kafkaconnector' works. mirage's own commands never need it.${C_0}"
+  say ""
+  say "${C_B}Connect REST API${C_0} ${C_DIM}(read-only, like production)${C_0}"
+  say ""
+  say "  ${C_B}$(api_curl_example)${C_0}"
+  say "  ${C_B}mirage api /connectors${C_0}   ${C_DIM}# same thing, without the header${C_0}"
+  say ""
+  say "Next:"
+  say "  ${C_B}mirage intro${C_0}      how the labs work"
+  say "  ${C_B}mirage list${C_0}       see the labs"
+  say "  ${C_B}mirage start 1${C_0}    begin"
+}
+
+# ----------------------------------------------------------------------- list
+
+cmd_list() {
+  hr
+  say "${C_B}Mirage incident-response labs${C_0}"
+  hr
+  printf '%-4s %-46s %-9s %s\n' "n" "scenario" "level" "result"
+  hr
+  local n
+  for n in $(all_lab_numbers); do
+    load_lab "$n"
+    local res icon
+    res="$(lab_result "$n")"
+    case "$res" in
+      pass) icon="${C_GRN}PASS${C_0}" ;;
+      fail) icon="${C_RED}fail${C_0}" ;;
+      *)    icon="${C_DIM}-${C_0}" ;;
+    esac
+    printf '%-4s %-46s %-9s %b\n' "$n" "$LAB_TITLE" "$LAB_DIFFICULTY" "$icon"
+  done
+  hr
+  local active
+  active="$(get_active)"
+  if [ -n "$active" ]; then
+    say "Lab ${C_B}$active${C_0} is currently active. Grade it with: ${C_B}mirage stop $active${C_0}"
+  else
+    say "Start one with: ${C_B}mirage start <n>${C_0}"
+  fi
+}
+
+# ---------------------------------------------------------------------- start
+
+cmd_start() {
+  local n="${1:-}"
+  [ -z "$n" ] && { err "Usage: mirage start <n>"; exit 1; }
+  require_cluster
+  load_lab "$n"
+
+  local active
+  active="$(get_active)"
+  if [ -n "$active" ] && [ "$active" != "$n" ]; then
+    warn "Lab $active is still active. Resetting to a clean baseline first."
+    cmd_reset quiet
+  fi
+
+  hr
+  # Number and level only: the title names the cause too often (lab 3's is the
+  # whole answer). It is shown again once you grade, in stop/solve/why.
+  say "${C_B}LAB $n${C_0}  ${C_DIM}[$LAB_DIFFICULTY]${C_0}"
+  hr
+  info "Restoring a clean baseline"
+  k delete resourcequota mirage-quota >/dev/null 2>&1 || true
+  k patch kafkanodepool source-pool --type json \
+    -p '[{"op":"remove","path":"/spec/template/pod/affinity"}]' >/dev/null 2>&1 || true
+  forget_broker_pods
+  # Delete connectors a previous lab renamed or added. restore_baseline brings
+  # the real one back, but it does NOT remove these, and a survivor silently
+  # breaks grading: it keeps mirroring lab-orders, so the throughput assertion
+  # every lab_check ends with passes on someone else's work while this lab's own
+  # connector is absent or dead. Seen for real: lab 4's `lab-orders-renamed`
+  # outlived its lab and lab 3 then graded 'tasks running: 0' alongside
+  # 'records replicate: 2000 >= 1600'.
+  k delete kafkaconnector lab-loopback lab-stray lab-orders-renamed \
+    lab-orders-recovered --wait=true >/dev/null 2>&1 || true
+  restore_baseline
+  clean_replicated_junk
+
+  # Start the lab on a worker whose log is empty, so a plain `kubectl logs`
+  # shows only this lab. Before settle_connector, so the replacement worker is
+  # what gets waited on.
+  #
+  # ~50s, and it exists purely for the HUMAN reading raw `kubectl logs` — every
+  # grader reads through worker_log, which is epoch-scoped and correct either
+  # way (audited: the only `kubectl logs` strings inside a lab_check are
+  # remediation hints, not reads). So the regression harness, which has no human
+  # and runs this 17 times, sets MIRAGE_SKIP_RECYCLE=1 and saves ~14 minutes a
+  # run. Never set it in an interactive session: the trainee's own
+  # `kubectl logs mirage-connect-0` would then show the previous lab's errors.
+  if [ "${MIRAGE_SKIP_RECYCLE:-0}" = "1" ]; then
+    info "Skipping the worker recycle (MIRAGE_SKIP_RECYCLE=1; graders are epoch-scoped)"
+  elif ! recycle_connect_worker; then
+    warn "the Connect worker did not come back after recycling."
+    warn "Older entries may still be from a previous lab. mirage logs --errors is scoped."
+  fi
+
+  if ! settle_connector 180; then
+    warn "baseline did not settle; the injected fault may not behave as described."
+    warn "If this lab misbehaves, run: mirage reset && mirage verify"
+  fi
+
+  # Clear per-lab scratch state, but keep the recorded result so `list` still
+  # shows what you have passed before.
+  local prev_result
+  prev_result="$(lab_result "$n")"
+  rm -f "$STATE_DIR"/lab"$n".* 2>/dev/null
+  [ "$prev_result" = "pass" ] && record_pass "$n"
+  unmark lab8.answer
+
+  say ""
+  info "Injecting the fault"
+  # Keep the Kafka forward alive across labs. Several labs replace broker or
+  # worker pods, which drops a pod-targeted forward silently — so re-establish
+  # it rather than leaving a dead port behind. Default to source on a cold
+  # start; otherwise keep whichever side the user chose.
+  kafka_pf_start "$(kafka_pf_side)" >/dev/null 2>&1 || \
+    kafka_pf_start source >/dev/null 2>&1 || true
+
+  # Draw the log boundary here, after the baseline settled and before anything
+  # is broken. Everything the worker logged for a previous lab is now out of
+  # scope for both the graders and `mirage logs` — see log_epoch_set.
+  log_epoch_set
+  # A lab that cannot build its fault (e.g. a missing credential) must not be
+  # presented as started — you would be hunting a fault that is not there, and
+  # no fix could pass the grade.
+  if ! lab_break; then
+    say ""
+    err "Lab $n was not injected. Nothing has been broken."
+    say "  Fix the problem above, then run ${C_B}mirage start $n${C_0} again."
+    clear_active
+    log_epoch_clear
+    exit 1
+  fi
+  set_active "$n"
+
+  say ""
+  hr
+  lab_brief
+  hr
+  say ""
+  say "${C_DIM}Production alert this maps to:${C_0} $LAB_ALERT"
+  say ""
+  say "Commands: ${C_B}mirage counts${C_0} | ${C_B}mirage topics${C_0} | ${C_B}mirage logs${C_0} | ${C_B}mirage hint $n${C_0}"
+}
+
+# ----------------------------------------------------------------------- stop
+
+cmd_stop() {
+  local n="${1:-$(get_active)}" active
+  [ -z "$n" ] && { err "No active lab. Usage: mirage stop <n>"; exit 1; }
+
+  # Refuse to grade a lab that is not the one running.
+  #
+  # Grading the wrong lab is not a harmless mistake: the environment holds the
+  # ACTIVE lab's fault, so the requested lab gets graded against a fault that
+  # was never injected for it. That produces a contradictory report — observed
+  # for real: `stop 3` while lab 4 was active reported "autoRestart unset" and
+  # "tasks running: 0" (lab 4 had deleted and renamed the connector lab 3
+  # grades) next to "records replicate 2000 >= 1600" (lab 4's connector was
+  # doing the mirroring). Nothing in that output points at the real problem,
+  # which is that the wrong lab was graded.
+  #
+  # It also overwrites that lab's recorded result with a meaningless FAIL.
+  # MIRAGE_FORCE_STOP bypasses both guards below. The regression harness grades
+  # deliberately and twice per lab, and a PASS clears `active` — so after a
+  # pre-fix FALSE pass the post-fix call would hit the "nothing active" guard
+  # and report a missing lab instead of the false-pass it exists to detect. The
+  # harness knows which lab it injected; a human does not need this.
+  if [ "${MIRAGE_FORCE_STOP:-0}" != "1" ]; then
+    active="$(get_active)"
+
+    if [ -n "$active" ] && [ "$n" != "$active" ]; then
+      err "Lab $active is the active lab, not lab $n."
+      say ""
+      say "  The cluster holds lab ${C_B}$active${C_0}'s fault, so grading lab $n would check it"
+      say "  against a fault that was never injected: the report would be"
+      say "  contradictory and lab $n would be recorded as failed."
+      say ""
+      say "  Grade the active lab:  ${C_B}mirage stop $active${C_0}"
+      say "  Or switch labs:        ${C_B}mirage reset${C_0} then ${C_B}mirage start $n${C_0}"
+      exit 1
+    fi
+
+    # Nothing active: the cluster is at its baseline, so there is no fault to
+    # find. Many checks pass against a healthy environment — every throughput
+    # assertion does — so this would report a partial or full PASS for work
+    # that was never done.
+    if [ -z "$active" ]; then
+      err "No lab is active, so there is nothing to grade."
+      say ""
+      say "  The cluster is at its baseline. Grading lab $n now would check a"
+      say "  healthy environment and could report a PASS you did not earn."
+      say ""
+      say "  Start it first:  ${C_B}mirage start $n${C_0}"
+      say "  See status:      ${C_B}mirage status${C_0}"
+      exit 1
+    fi
+  fi
+
+  require_cluster
+  load_lab "$n"
+
+  hr
+  say "${C_B}Grading lab $n — $LAB_TITLE${C_0}"
+  hr
+  mark "lab$n.attempted" 1
+  reset_assertions
+  grade_start_set
+  lab_check
+  say ""
+
+  if report_result "$n"; then
+    record_pass "$n"
+    clear_active
+    say ""
+    say "Debrief: ${C_B}mirage why $n${C_0}  ${C_DIM}(what was really happening, and the rule)${C_0}"
+    say "Then reset with ${C_B}mirage reset${C_0}, or go on with ${C_B}mirage next${C_0}."
+    exit 0
+  else
+    record_fail "$n"
+    exit 1
+  fi
+}
+
+# ------------------------------------------------------------- hint / solve
+
+cmd_hint() {
+  local n level
+  # Accept `hint`, `hint 7`, `hint 7 2`, and `hint 2` while a lab is active.
+  if [ -n "${1:-}" ] && [ -n "${2:-}" ]; then
+    n="$1"; level="$2"
+  elif [ -n "${1:-}" ] && [ -n "$(get_active)" ] && [ "$1" != "$(get_active)" ] \
+       && [ "$1" -le 9 ] 2>/dev/null && ! lab_file "$1" >/dev/null 2>&1; then
+    n="$(get_active)"; level="$1"
+  elif [ -n "${1:-}" ]; then
+    n="$1"; level=""
+  else
+    n="$(get_active)"; level=""
+  fi
+  [ -z "$n" ] && { err "Usage: mirage hint <lab> [level]"; exit 1; }
+  load_lab "$n"
+
+  # Hints are written as blank-line-separated blocks, ordered general to
+  # specific. Reveal them a block at a time so a nudge stays a nudge: dumping
+  # the whole thing spends the hint in one go and often gives the answer away.
+  local total text
+  text="$(lab_hint)"
+  total="$(printf '%s\n' "$text" | awk 'BEGIN{n=1;seen=0} /^[[:space:]]*$/{if(seen){n++;seen=0};next} {seen=1} END{print (seen? n : n-1)}')"
+  [ -z "$total" ] || [ "$total" -lt 1 ] 2>/dev/null && total=1
+
+  if [ -z "$level" ]; then level=$(( $(marked "lab$n.hintlevel" 2>/dev/null || echo 0) + 1 )); fi
+  [ "$level" -lt 1 ] 2>/dev/null && level=1
+  [ "$level" -gt "$total" ] && level="$total"
+  mark "lab$n.hintlevel" "$level"
+
+  hr; say "${C_B}Hint — lab $n${C_0}  ${C_DIM}(step $level of $total)${C_0}"; hr
+  printf '%s\n' "$text" | awk -v want="$level" '
+    BEGIN{n=1;seen=0}
+    /^[[:space:]]*$/{ if(seen){n++;seen=0}; if(n<=want) print; next }
+    { seen=1; if(n<=want) print }'
+  say ""
+  if [ "$level" -lt "$total" ]; then
+    say "${C_DIM}More:${C_0} ${C_B}mirage hint $n $((level+1))${C_0}   ${C_DIM}(or just${C_0} mirage hint $n ${C_DIM}again)${C_0}"
+  else
+    say "${C_DIM}That is every hint.${C_0} Full answer: ${C_B}mirage solve $n${C_0}"
+  fi
+}
+
+cmd_solve() {
+  local n="${1:-$(get_active)}"
+  [ -z "$n" ] && { err "Usage: mirage solve <n>"; exit 1; }
+  load_lab "$n"
+
+  # Not a gate — you can always read the answer. But if you have not graded an
+  # attempt yet, point at the cheaper options first: a failed grade tells you
+  # which half is wrong, and that is most of the learning.
+  if [ -z "$(marked "lab$n.attempted")" ] && [ "$(lab_result "$n")" != "pass" ]; then
+    warn "You have not graded an attempt at lab $n yet."
+    say ""
+    say "  Before the full answer, these cost less and teach more:"
+    say "    ${C_B}mirage diff${C_0}      what the fault actually changed"
+    say "    ${C_B}mirage stop $n${C_0}    grade an attempt — the failures name the gap"
+    say "    ${C_B}mirage hint $n${C_0}    one nudge at a time"
+    say ""
+    printf '  Show the full solution anyway? [y/N] '
+    local reply=""
+    read -r reply 2>/dev/null || reply=y   # non-interactive: just show it
+    case "$reply" in
+      y|Y|yes|YES) ;;
+      *) say ""; say "Nothing shown. Try ${C_B}mirage hint $n${C_0} first."; return 0 ;;
+    esac
+    say ""
+  fi
+
+  hr; say "${C_B}Solution — lab $n: $LAB_TITLE${C_0}"; hr
+  lab_solve
+  say ""
+  warn "Having read this, re-run 'mirage stop $n' to confirm you applied it."
+}
+
+# --------------------------------------------------------------- inspection
+
+# Difficulty-ordered path through the labs, not numeric order.
+# Connector-focused faults first, then security, then cluster/platform, with the
+# multi-fault exam last. Lab 16 sits after 10 because it needs the SMT/converter
+# grounding that 9 and 10 build, and before the cluster labs.
+LAB_ORDER="1 9 5 2 10 15 13 14 3 6 8 16 18 17 4 7 11 19 12"
+
+cmd_next() {
+  local n
+  for n in $LAB_ORDER; do
+    if [ "$(lab_result "$n")" != "pass" ]; then
+      load_lab "$n"
+      hr
+      say "${C_B}Next up: LAB $n${C_0}  ${C_DIM}[$LAB_DIFFICULTY]${C_0}"
+      hr
+      say "  ${C_B}mirage start $n${C_0}"
+      return 0
+    fi
+  done
+  hr
+  local n_labs
+  n_labs="$(printf '%s\n' $LAB_ORDER | grep -c .)"
+  say "${C_GRN}${C_B}  All $n_labs labs passed.  ${C_0}"
+  hr
+  say "Re-run any of them with ${C_B}mirage start <n>${C_0} to stay sharp."
+}
+
+cmd_verify() {
+  require_cluster
+  hr; say "${C_B}Environment verification${C_0}"; hr
+  reset_assertions
+
+  assert_ge "Strimzi operator running" \
+    "$(kq get deploy strimzi-cluster-operator -o jsonpath='{.status.readyReplicas}' || echo 0)" 1 \
+    "Nothing reconciles without the operator." "kubectl -n $NS get deploy strimzi-cluster-operator"
+
+  local sready tready
+  sready="$(kq get kafka kafka-source -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}')"
+  tready="$(kq get kafka kafka-target -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}')"
+  assert_eq "source Kafka cluster Ready" "${sready:-missing}" "True" \
+    "Labs replicate source -> target; without the source there is nothing to mirror." \
+    "kubectl -n $NS get kafka kafka-source"
+  assert_eq "target Kafka cluster Ready" "${tready:-missing}" "True" \
+    "The mirror writes here." "kubectl -n $NS get kafka kafka-target"
+
+  assert "source broker pod discoverable" "$([ -n "$(src_pod)" ] && echo 0 || echo 1)" \
+    "Helpers exec into the broker to count records." \
+    "kubectl -n $NS get pods -l strimzi.io/broker-role=true"
+  assert "target broker pod discoverable" "$([ -n "$(tgt_pod)" ] && echo 0 || echo 1)" \
+    "Same." "kubectl -n $NS get pods -l strimzi.io/broker-role=true"
+
+  local cready
+  cready="$(kq get kafkaconnect "$CONNECT" -o jsonpath='{range .status.conditions[?(@.type=="Ready")]}{.status}{end}')"
+  assert_eq "KafkaConnect cluster Ready" "${cready:-missing}" "True" \
+    "Workers host the connector tasks." "kubectl -n $NS get kafkaconnect"
+
+  assert_ge "at least one Connect worker Running" "$(ready_connect_pods)" 1 \
+    "" "kubectl -n $NS get pods -l strimzi.io/cluster=$CONNECT"
+
+  assert_ge "source topic has 12 partitions" \
+    "$(topic_partitions "$(src_pod)" "$SRC_BOOT" "$TOPIC")" 12 \
+    "Lab 1 depends on a 12-partition topic." \
+    "kubectl -n $NS get kafkatopic $TOPIC"
+
+  assert "connector exists" "$(conn_exists && echo 0 || echo 1)" \
+    "The baseline connector is what every lab breaks." \
+    "kubectl -n $NS get kafkaconnector"
+
+  assert_ge "connector has running tasks" "$(conn_task_count RUNNING)" 1 \
+    "" "kubectl -n $NS describe kafkaconnector $CONNECTOR"
+
+  # Labs 13-15 build their fault out of these passwords. If the Secrets are
+  # missing the labs would inject password="" and be unwinnable, so surface it
+  # here rather than three labs later.
+  local u
+  for u in kcd-replicator kcd-readonly; do
+    assert "SCRAM user $u has a readable password" \
+      "$([ -n "$(scram_password "$u")" ] && echo 0 || echo 1)" \
+      "Security labs 13-15 cannot be injected without it. Apply manifests/users.yaml and wait for the user operator." \
+      "kubectl -n $NS get kafkauser $u; kubectl -n $NS get secret $u"
+  done
+  assert "target cluster CA password readable" \
+    "$([ -n "$(target_ca_password)" ] && echo 0 || echo 1)" \
+    "The TLS lab's truststore password comes from here." \
+    "kubectl -n $NS get secret kafka-target-cluster-ca-cert"
+
+  # The CR is desired state; the REST API is what the worker is running. They
+  # diverge when Connect rejects a config (400) or refuses one mid-rebalance
+  # (500), and every health signal can look fine while they disagree.
+  local cr_topics rt_topics
+  cr_topics="$(conn_get '.spec.config.topics')"
+  rt_topics="$(runtime_config_value topics)"
+  assert_eq "CR and runtime config agree" "${rt_topics:-unreachable}" "${cr_topics:-unset}" \
+    "If these differ, the operator could not push config to Connect — usually a rejected config or a blocked rebalance. Fix the worker cluster, not the connector." \
+    "kubectl -n $NS get kafkaconnector $CONNECTOR -o jsonpath='{.spec.config.topics}' vs mirage api /connectors/$CONNECTOR/config"
+
+  assert "JMX metrics endpoint responding on :9404" \
+    "$([ -n "$(metric 'kafka_connect_worker')" ] && echo 0 || echo 1)" \
+    "Metric names here match production; several labs ask you to read them." \
+    "mirage metrics"
+
+  # Reported, never asserted. The ingress is an operator convenience: no lab
+  # grades through it, and a dead port-forward must not read as a broken
+  # environment.
+  #
+  # api_start rather than api_up: a no-op when the path is healthy, and
+  # otherwise one restart attempt, so what gets reported is a real failure
+  # rather than a forward that merely died while the laptop slept.
+  if api_start >/dev/null 2>&1; then
+    say "  ${C_GRN}ok${C_0}      Connect REST API reachable — $(api_curl_example)"
+  else
+    warn "Connect REST API not reachable from the host (not a lab failure). Run: mirage api"
+  fi
+
+  # Same treatment for the Kafka forward: a convenience, never a lab failure.
+  local kside; kside="$(kafka_pf_side)"
+  [ -n "$kside" ] || kside=source
+  if kafka_pf_start "$kside" >/dev/null 2>&1 && kafka_hosts_entry_ok "$kside"; then
+    say "  ${C_GRN}ok${C_0}      Kafka CLI reachable — kafka-topics --bootstrap-server localhost:$KAFKA_PORT --list"
+  elif kafka_hosts_entry_ok "$kside"; then
+    warn "Kafka port-forward not up (not a lab failure). Run: mirage kafka"
+  else
+    warn "Kafka CLI needs a one-time hosts entry (not a lab failure):"
+    say "    ${C_B}echo '127.0.0.1 $(kafka_advertised_host "$kside")' | sudo tee -a /etc/hosts${C_0}"
+  fi
+
+  info "End-to-end replication test (produces 500 records)"
+  local before after n=0
+  before="$(tgt_count)"
+  produce 500 1000 500
+  while [ "$n" -lt 90 ]; do
+    after="$(tgt_count)"
+    [ "${after:-0}" -ge $(( ${before:-0} + 400 )) ] && break
+    sleep 5; n=$((n+5))
+  done
+  after="$(tgt_count)"
+  assert_ge "records replicate source -> target" "$(( ${after:-0} - ${before:-0} ))" 400 \
+    "This is the whole pipeline. If it fails, fix the environment before starting labs." \
+    "mirage counts  (target went $before -> $after)"
+
+  say ""
+  if report_result "environment"; then
+    say ""
+    say "Environment is healthy. Start with: ${C_B}mirage start 1${C_0}"
+    return 0
+  fi
+  say ""
+  say "Try ${C_B}mirage reset${C_0}, or re-run ${C_B}mirage setup${C_0}."
+  return 1
+}
+
+cmd_status() {
+  hr; say "${C_B}Cluster${C_0}"; hr
+  if ! cluster_up; then
+    err "No reachable cluster. Run: mirage setup"
+    exit 1
+  fi
+  printf '  context      %s\n' "$(kubectl config current-context 2>/dev/null)"
+  printf '  namespace    %s\n' "$NS"
+  printf '  provider     %s\n' "$(provider_saved || provider_detect || echo unknown)"
+  if api_up; then
+    printf '  REST API     %sup%s   %s\n' "$C_GRN" "$C_0" "$(api_curl_example)"
+  elif api_pf_alive; then
+    # Distinguishing these two matters: a live process that cannot serve means
+    # nginx or the Connect Service is the problem, not the forward.
+    printf '  REST API     %sforward alive but not routing%s  (mirage api)\n' "$C_YEL" "$C_0"
+  else
+    printf '  REST API     %sdown%s  (mirage api)\n' "$C_YEL" "$C_0"
+  fi
+  say ""
+  say "${C_B}Pods${C_0}"
+  k get pods -o custom-columns='NAME:.metadata.name,PHASE:.status.phase,RESTARTS:.status.containerStatuses[0].restartCount' 2>/dev/null | sed 's/^/  /'
+  say ""
+  say "${C_B}Strimzi resources${C_0}"
+  k get kafka,kafkaconnect,kafkaconnector 2>/dev/null | sed 's/^/  /'
+  say ""
+  local q
+  q="$(k get resourcequota -o name 2>/dev/null)"
+  if [ -n "$q" ]; then
+    say "${C_B}ResourceQuota${C_0}"
+    k get resourcequota -o custom-columns='NAME:.metadata.name,CPU:.status.used.requests\.cpu,MEM:.status.used.requests\.memory,PODS:.status.used.pods' 2>/dev/null | sed 's/^/  /'
+    say ""
+  fi
+  say "${C_B}Lab state${C_0}"
+  local active
+  active="$(get_active)"
+  printf '  active lab   %s\n' "${active:-none}"
+  say ""
+  cmd_counts
+}
+
+cmd_counts() {
+  require_cluster
+  local s t
+  s="$(src_count)"; t="$(tgt_count)"
+  say "${C_B}Record counts — topic $TOPIC${C_0}"
+  printf '  source   %s\n' "${s:-?}"
+  printf '  target   %s\n' "${t:-?}"
+  local d=$(( ${s:-0} - ${t:-0} ))
+  if [ "$d" -eq 0 ]; then
+    printf '  deficit  %s0 — in sync%s\n' "$C_GRN" "$C_0"
+  elif [ "$d" -lt 0 ]; then
+    # Target AHEAD of source = duplicates, now or in the past: a task that keeps
+    # failing under autoRestart re-sends what it delivered (lab 18), and a
+    # restored offsets topic replays (lab 11). Cumulative, so not proof of "now".
+    printf '  deficit  %starget holds %s MORE than source — duplicates were delivered at some point%s\n' "$C_YEL" "$(( -d ))" "$C_0"
+  else
+    printf '  deficit  %s%s%s\n' "$C_YEL" "$d" "$C_0"
+  fi
+
+  # Task state is checked whatever the counts say. One FAILED task freezes only
+  # its own partitions; the others carry the load, so totals and deltas read
+  # healthy — and autoRestart's re-sends can even put the target ahead.
+  local running total tasks_ok=1
+  running="$(conn_task_count RUNNING)"; total="$(conn_tasks_total)"
+  if [ "${total:-0}" -ge 1 ] && [ "${running:-0}" -lt "${total:-0}" ]; then
+    tasks_ok=0
+    say "  ${C_RED}only ${running} of ${total} tasks RUNNING${C_0} ${C_DIM}— their partitions are not replicating; start with: mirage status${C_0}"
+  fi
+
+  # A cumulative deficit is NOT evidence of a broken pipeline. Any lab that
+  # re-seeds the target (7, 12) leaves history behind that will never be
+  # re-replicated, because a fresh connector starts at the current offset. That
+  # shows up as a large CONSTANT deficit while replication is perfectly healthy.
+  # Measure a delta instead — that is what every lab's grader does.
+  if { [ "$d" -ne 0 ] || [ "$tasks_ok" -eq 0 ]; } && [ "${1:-}" != "--quick" ]; then
+    say ""
+    info "Cumulative counts can mislead. Measuring a live delta (produces 300)"
+    local delta gaps_b gaps_a stuck
+    gaps_b="$(partition_gaps)"
+    # batch.size below one record: the sticky partitioner then moves on after
+    # every record, so all 12 partitions get some of the 300 and a frozen one
+    # cannot hide by receiving none.
+    delta="$(replication_delta 300 60 batch.size=1000)"
+    # replication_delta returns at 80%, so give healthy partitions time to land
+    # the rest before calling a growing gap a stall.
+    sleep 10
+    gaps_a="$(partition_gaps)"
+    stuck="$(gaps_grew "$gaps_b" "$gaps_a")"
+    if [ "${delta:-0}" -eq 0 ]; then
+      say "  ${C_RED}replication is dead${C_0} — 0 of 300 new records arrived"
+      say "  ${C_DIM}Start with: mirage status, then mirage logs${C_0}"
+    elif [ -n "$stuck" ]; then
+      say "  ${C_RED}partitions falling behind: ${stuck}${C_0} — ${delta} of 300 new records arrived"
+      say "  ${C_DIM}The rest of the topic is flowing, so whole-topic numbers look fine."
+      say "  A task owns a set of partitions — start with: mirage status${C_0}"
+    elif [ "$tasks_ok" -eq 0 ]; then
+      say "  ${C_YEL}${delta} of 300 new records arrived, but NOT through every task${C_0}"
+      say "  ${C_DIM}A healthy-looking delta here is the other tasks. Not healthy.${C_0}"
+    elif [ "${delta:-0}" -ge 240 ]; then
+      say "  ${C_GRN}replication is healthy${C_0} — ${delta} of 300 new records arrived"
+      if [ "$d" -gt 0 ]; then
+        say "  ${C_DIM}Records flow NOW. The ${d}-record deficit is history: after a re-seed"
+        say "  (reset --fresh, labs 7/12) that is expected. Without one, those are records"
+        say "  the connector SKIPPED — a lost offset position, not a slow pipeline.${C_0}"
+      fi
+    else
+      say "  ${C_YEL}replication is slow${C_0} — only ${delta} of 300 new records arrived"
+    fi
+  fi
+}
+
+# ---- diff: what does the current state look like next to the baseline? ----
+# The single most useful on-call reflex is comparing desired state against what
+# is actually running. Without this, a lab is a memory game about where faults
+# hide; with it, you learn the comparison itself.
+cmd_diff() {
+  require_cluster
+  local tmp cr_file
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/mirage-diff.XXXXXX")" || { err "cannot create temp dir"; exit 1; }
+  # shellcheck disable=SC2064
+  trap "rm -rf '$tmp'" EXIT
+
+  hr; say "${C_B}Baseline vs. running state${C_0}"; hr
+
+  # --- KafkaConnector config ---
+  say ""
+  say "${C_B}KafkaConnector $CONNECTOR${C_0} ${C_DIM}(manifest -> live CR)${C_0}"
+  python3 -I - "$LAB_HOME/manifests/connector.yaml" > "$tmp/base.txt" <<'PY' 2>/dev/null
+import sys, re
+# Minimal reader: the lab manifests are flat spec.config maps, so parse rather
+# than require PyYAML, which is not guaranteed to be installed.
+txt = open(sys.argv[1]).read()
+out = {}
+m = re.search(r'^\s*tasksMax:\s*(\S+)', txt, re.M)
+if m: out['tasksMax'] = m.group(1).strip('"\'')
+cfg = re.search(r'^\s*config:\s*$(.*)', txt, re.M | re.S)
+if cfg:
+    for line in cfg.group(1).splitlines():
+        mm = re.match(r'^\s{4,}([A-Za-z0-9_.\-]+):\s*(.*)$', line)
+        if mm:
+            out[mm.group(1)] = mm.group(2).strip().strip('"\'')
+for k in sorted(out):
+    v = out[k]
+    # YAML double-quoted scalars escape backslashes, so the manifest holds
+    # '\\.' where the live CR holds '\.'. Without unescaping, every regex
+    # value reports a phantom difference.
+    v = v.replace('\\\\', '\\')
+    print(f"{k}={v}")
+PY
+
+  kq get kafkaconnector "$CONNECTOR" -o json 2>/dev/null \
+    | py_json 'cfg = d.get("spec", {}).get("config", {}) or {}
+tm = d.get("spec", {}).get("tasksMax")
+if tm is not None: print(f"tasksMax={tm}")
+for k in sorted(cfg): print(f"{k}={cfg[k]}")' > "$tmp/live.txt" 2>/dev/null
+
+  if [ ! -s "$tmp/live.txt" ]; then
+    warn "  connector $CONNECTOR not found — it may have been deleted or renamed"
+    kq get kafkaconnector --no-headers 2>/dev/null | awk '{print "    present: "$1}'
+  else
+    _print_kv_diff "$tmp/base.txt" "$tmp/live.txt"
+  fi
+
+  # --- CR vs what the WORKER is actually running ---
+  say ""
+  say "${C_B}CR vs worker runtime${C_0} ${C_DIM}(spec.config -> REST /connectors/<n>/config)${C_0}"
+  local drift=0 key crv rtv
+  # NOTE: tasks.max is deliberately absent. Strimzi owns it via spec.tasksMax
+  # and pops it out of spec.config, so "CR unset / runtime 12" is correct here,
+  # not drift — reporting it would teach the wrong lesson.
+  for key in topics transforms target.cluster.bootstrap.servers \
+             source.cluster.bootstrap.servers topics.exclude; do
+    crv="$(conn_get ".spec.config.$(printf '%s' "$key" | sed 's/\./\\./g')")"
+    rtv="$(runtime_config_value "$key")"
+    if [ -n "$crv$rtv" ] && [ "$crv" != "$rtv" ]; then
+      printf '  %s~%s %s\n' "$C_YEL" "$C_0" "$key"
+      printf '      CR:      %s\n' "${crv:-<unset>}"
+      printf '      runtime: %s\n' "${rtv:-<unset>}"
+      drift=1
+    fi
+  done
+  if [ "$drift" -eq 0 ]; then
+    say "  ${C_GRN}no drift${C_0} — the worker is running what the CR asks for"
+  else
+    say ""
+    say "  ${C_DIM}Drift means the operator could not push config to Connect: usually a"
+    say "  rejected config (400) or a blocked rebalance. Fix the worker, not the CR.${C_0}"
+  fi
+
+  # --- KafkaConnect worker shape ---
+  say ""
+  say "${C_B}KafkaConnect $CONNECT${C_0}"
+  local want have
+  want="$(connect_get '.spec.replicas')"; have="$(ready_connect_pods)"
+  printf '  replicas     desired=%s running=%s' "${want:-?}" "${have:-0}"
+  [ "${have:-0}" != "${want:-0}" ] && printf '   %s<- mismatch%s' "$C_YEL" "$C_0"
+  printf '\n'
+  printf '  memory       request=%s limit=%s\n' \
+    "$(connect_get '.spec.resources.requests.memory')" \
+    "$(connect_get '.spec.resources.limits.memory')"
+  printf '  heap         -Xms=%s -Xmx=%s\n' \
+    "$(connect_get '.spec.jvmOptions.-Xms')" "$(connect_get '.spec.jvmOptions.-Xmx')"
+  # The four identity settings. Renaming any of them points the workers at
+  # empty internal topics — no error, no failed status (lab 11).
+  local idk bv lv
+  for idk in group.id config.storage.topic offset.storage.topic status.storage.topic; do
+    bv="$(awk -v k="$idk:" '$1==k {print $2; exit}' "$LAB_HOME/manifests/connect.yaml")"
+    lv="$(connect_get ".spec.config.${idk//./\\.}")"
+    printf '  %-21s %s' "$idk" "${lv:-<unset>}"
+    [ "$lv" != "$bv" ] && printf '   %s<- baseline: %s%s' "$C_YEL" "$bv" "$C_0"
+    printf '\n'
+  done
+
+  # --- things that only exist when a lab broke something ---
+  say ""
+  say "${C_B}Anomalies${C_0}"
+  local found=0
+  local extra
+  extra="$(kq get kafkaconnector --no-headers 2>/dev/null | awk -v keep="$CONNECTOR" '$1!=keep {print $1}')"
+  if [ -n "$extra" ]; then
+    printf '%s\n' "$extra" | while read -r c; do
+      printf '  %s+%s unexpected connector: %s\n' "$C_YEL" "$C_0" "$c"
+    done
+    found=1
+  fi
+  if kq get resourcequota mirage-quota >/dev/null 2>&1; then
+    printf '  %s+%s ResourceQuota present: %s of %s\n' "$C_YEL" "$C_0" \
+      "$(kq get resourcequota mirage-quota -o jsonpath='{.status.used.requests\.memory}')" \
+      "$(kq get resourcequota mirage-quota -o jsonpath='{.status.hard.requests\.memory}')"
+    found=1
+  fi
+  if kq get kafkanodepool source-pool -o jsonpath='{.spec.template.pod.affinity}' 2>/dev/null | grep -q .; then
+    printf '  %s+%s source-pool has a pod affinity rule (broker may be unschedulable)\n' "$C_YEL" "$C_0"
+    found=1
+  fi
+  local junk
+  junk="$(list_target_topics 2>/dev/null | grep -cE '\.heartbeats$|^mm2-|\.internal$|\.replica$' || true)"
+  if [ "${junk:-0}" -gt 0 ]; then
+    printf '  %s+%s %s replication artefact topic(s) on the target\n' "$C_YEL" "$C_0" "$junk"
+    found=1
+  fi
+  local storesets
+  storesets="$(list_target_topics 2>/dev/null | grep -cE -- '-connect-configs$' || true)"
+  if [ "${storesets:-0}" -gt 1 ]; then
+    printf '  %s+%s %s sets of Connect internal topics on the target (one cluster should have one)\n' "$C_YEL" "$C_0" "$storesets"
+    found=1
+  fi
+  [ "$found" -eq 0 ] && say "  ${C_GRN}none${C_0}"
+
+  say ""
+  say "${C_DIM}This is the comparison to reach for first in a real incident:"
+  say "desired state (CR) vs actual state (runtime), then what is present that"
+  say "should not be.${C_0}"
+}
+
+# Print a key=value diff between two sorted files, ignoring unchanged keys.
+_print_kv_diff() {
+  local base="$1" live="$2" any=0
+  while IFS= read -r line; do
+    local k v bv
+    k="${line%%=*}"; v="${line#*=}"
+    bv="$(grep -m1 "^${k}=" "$base" 2>/dev/null | sed "s/^${k}=//")"
+    if [ -z "$bv" ]; then
+      printf '  %s+%s %s = %s %s(added by the fault, or by you)%s\n' "$C_YEL" "$C_0" "$k" "$v" "$C_DIM" "$C_0"
+      any=1
+    elif [ "$bv" != "$v" ]; then
+      printf '  %s~%s %s\n' "$C_YEL" "$C_0" "$k"
+      printf '      baseline: %s\n' "$bv"
+      printf '      now:      %s\n' "$v"
+      any=1
+    fi
+  done < "$live"
+  while IFS= read -r line; do
+    local k
+    k="${line%%=*}"
+    if ! grep -q "^${k}=" "$live" 2>/dev/null; then
+      printf '  %s-%s %s %s(removed — baseline had: %s)%s\n' "$C_RED" "$C_0" "$k" "$C_DIM" "${line#*=}" "$C_0"
+      any=1
+    fi
+  done < "$base"
+  [ "$any" -eq 0 ] && say "  ${C_GRN}identical to the baseline manifest${C_0}"
+}
+
+cmd_topics() {
+  require_cluster
+  say "${C_B}Source cluster topics${C_0}"
+  _kafka_in "$(src_pod)" "bin/kafka-topics.sh --bootstrap-server $SRC_BOOT --list" | sed 's/^/  /'
+  say ""
+  say "${C_B}Target cluster topics${C_0}"
+  list_target_topics | sed 's/^/  /'
+}
+
+cmd_logs() {
+  require_cluster
+  local pod
+  pod="$(connect_pod)"
+  [ -z "$pod" ] && { err "No Connect pod found"; exit 1; }
+
+  # `logs --errors` filters to the patterns the on-call log cookbook lists, so
+  # the same greps you would reach for in production are the ones you practise
+  # here. Plain `logs` keeps following the stream as before.
+  if [ "${1:-}" = "--errors" ] || [ "${1:-}" = "-e" ]; then
+    local lines="${2:-2000}" epoch
+    epoch="$(log_epoch)"
+    # Scoped to the active lab, so a signature the PREVIOUS lab left in the
+    # worker's log is not presented as evidence about this one.
+    if [ -n "$epoch" ]; then
+      info "Scanning $pod for known failure signatures since this lab started"
+    else
+      info "Scanning the last $lines lines of $pod for known failure signatures"
+    fi
+    say ""
+    local out
+    out="$(worker_log "$lines" | grep -nE \
+      'ERROR|^Caused by:|RecordTooLargeException|InvalidTimestampException|OutOfMemoryError|SaslAuthenticationException|TopicAuthorizationException|SSLHandshakeException|keystore password was incorrect|Authentication failed|Not authorized|DataException|ConnectException|Cancelled in-flight FETCH|socket connection setup timeout|Error setting zookeeper data|Received exception when fetching|Maximum number of metrics reached|rebalance')"
+    if [ -z "$out" ]; then
+      if [ -n "$epoch" ]; then
+        say "  ${C_GRN}no known failure signatures since this lab started${C_0}"
+      else
+        say "  ${C_GRN}no known failure signatures in the last $lines lines${C_0}"
+      fi
+      say ""
+      say "  ${C_DIM}That does not mean healthy — a stale connector logs nothing at all."
+      say "  Check throughput with: mirage counts${C_0}"
+      return 0
+    fi
+    printf '%s\n' "$out" | cut -c1-200 | sed 's/^/  /'
+    say ""
+    say "${C_B}What these mean${C_0}"
+    printf '%s\n' "$out" | grep -qE 'SaslAuthenticationException|Authentication failed' && \
+      say "  ${C_YEL}SaslAuthenticationException${C_0}  bad credentials. TLS already succeeded."
+    printf '%s\n' "$out" | grep -q 'TopicAuthorizationException' && \
+      say "  ${C_YEL}TopicAuthorizationException${C_0} credentials are VALID — an ACL is missing."
+    printf '%s\n' "$out" | grep -qE 'SSLHandshakeException|keystore password' && \
+      say "  ${C_YEL}SSLHandshakeException${C_0}      truststore problem; SASL never ran."
+    printf '%s\n' "$out" | grep -q 'RecordTooLargeException' && \
+      say "  ${C_YEL}RecordTooLargeException${C_0}    the TARGET refused a record over its size limit (lab 16)."
+    printf '%s\n' "$out" | grep -q 'InvalidTimestampException' && \
+      say "  ${C_YEL}InvalidTimestampException${C_0}  the TARGET refused a record's timestamp (lab 18)."
+    printf '%s\n' "$out" | grep -q 'Unrecoverable exception from producer send callback' && \
+      say "  ${C_YEL}Unrecoverable ... send callback${C_0}  that task is FAILED; only its partitions stop."
+    printf '%s\n' "$out" | grep -q 'OutOfMemoryError' && \
+      say "  ${C_YEL}OutOfMemoryError${C_0}           heap too small for the workload (lab 3)."
+    printf '%s\n' "$out" | grep -q 'DataException' && \
+      say "  ${C_YEL}DataException${C_0}              converter/SMT mismatch (lab 9/10)."
+    printf '%s\n' "$out" | grep -qE 'Cancelled in-flight FETCH|socket connection setup timeout' && \
+      say "  ${C_YEL}fetch/socket timeouts${C_0}      broker-side or network, not the connector."
+    if printf '%s\n' "$out" | grep -q 'replication-target-admin'; then
+      say ""
+      say "  ${C_DIM}Note: 'replication-target-admin' in the thread name means the failure is"
+      say "  on the mirror's admin client — tasks can stay RUNNING while nothing moves.${C_0}"
+    fi
+    return 0
+  fi
+
+  # A follow is live output, so a tail of it cannot contain a previous lab's
+  # errors for long — but the first screenful can. Start the stream at the
+  # epoch when a lab is active.
+  local epoch
+  epoch="$(log_epoch)"
+  info "Tailing $pod (Ctrl-C to stop).  Tip: mirage logs --errors"
+  if [ -n "$epoch" ]; then
+    k logs -f "$pod" --since-time="$epoch" --tail="${1:-80}"
+  else
+    k logs -f "$pod" --tail="${1:-80}"
+  fi
+}
+
+# ---- why: the debrief you would otherwise only see inside `solve` ----
+# Fixing a lab yourself means never reading its solve, so the mechanism, the
+# production equivalent and the transferable rule all go unread by exactly the
+# people who earned them. `why` is that debrief, separated from the answer.
+cmd_why() {
+  local n="${1:-$(get_active)}"
+  [ -z "$n" ] && { err "Usage: mirage why <n>"; exit 1; }
+  load_lab "$n"
+  # shellcheck disable=SC1091
+  source "$LAB_HOME/lib/debriefs.sh"
+  why_lab "$n"
+
+  if [ -z "$WHY_MECHANISM$WHY_SIGNAL$WHY_PROD$WHY_RULE" ]; then
+    warn "No debrief written for lab $n yet."
+    say "Its teaching notes are inside ${C_B}mirage solve $n${C_0}."
+    return 0
+  fi
+
+  hr; say "${C_B}Debrief — lab $n: $LAB_TITLE${C_0}"; hr
+
+  _why_block() {   # $1 = heading, $2 = body
+    [ -z "$2" ] && return 0
+    say ""
+    say "${C_B}$1${C_0}"
+    # The source text is hard-wrapped already, so collapse it to one line first
+    # and re-flow; folding it as-is double-wraps and leaves ragged stubs.
+    printf '%s' "$2" | tr '\n' ' ' | tr -s ' ' | fold -s -w 74 \
+      | sed 's/[[:space:]]*$//' | sed 's/^/  /'
+    printf '\n'
+  }
+
+  _why_block "What was actually happening" "$WHY_MECHANISM"
+  _why_block "How it shows up" "$WHY_SIGNAL"
+  _why_block "At MirageDuel" "$WHY_PROD"
+
+  if [ -n "$WHY_RULE" ]; then
+    say ""
+    say "${C_B}The rule worth keeping${C_0}"
+    printf '%s\n' "$WHY_RULE" | tr '\n' ' ' | tr -s ' ' | fold -s -w 72 \
+      | sed 's/[[:space:]]*$//' | sed "s/^/  ${C_GRN}>${C_0} /"
+  fi
+
+  say ""
+  say "${C_DIM}Alert this maps to:${C_0} $LAB_ALERT"
+  say ""
+  local nxt
+  nxt="$(marked "lab$n.result" >/dev/null 2>&1; echo "")"
+  if [ "$(lab_result "$n")" = "pass" ]; then
+    say "${C_DIM}Next:${C_0} ${C_B}mirage next${C_0}"
+  else
+    say "${C_DIM}You have not passed this lab yet — ${C_0}${C_B}mirage start $n${C_0}${C_DIM} to try it.${C_0}"
+  fi
+  unset -f _why_block
+}
+
+# ---- env: point the CALLING shell at the lab cluster ----
+# A child process cannot export into its parent, so this prints the assignment
+# for you to eval. `kubectl config set-context` has already pinned the
+# namespace, so KUBECONFIG is the only thing the shell needs.
+cmd_env() {
+  if [ "${1:-}" = "--export" ] || [ ! -t 1 ]; then
+    # Machine-readable: `eval "$(mirage env --export)"`
+    printf 'export KUBECONFIG=%s\n' "$STATE_DIR/kubeconfig"
+    return 0
+  fi
+  hr; say "${C_B}Point this shell at the lab cluster${C_0}"; hr
+  say ""
+  say "  ${C_B}eval \"\$(./mirage env --export)\"${C_0}"
+  say ""
+  say "Or directly:"
+  say ""
+  say "  ${C_B}export KUBECONFIG=\"$STATE_DIR/kubeconfig\"${C_0}"
+  say ""
+  say "${C_DIM}The namespace is pinned to '$NS' inside that kubeconfig, so plain"
+  say "'kubectl get kafkaconnector' works — no -n mirage needed.${C_0}"
+  say ""
+  if [ "${KUBECONFIG:-}" = "$STATE_DIR/kubeconfig" ]; then
+    say "  ${C_GRN}This shell is already pointed at the lab cluster.${C_0}"
+  else
+    say "  ${C_YEL}This shell is NOT pointed at the lab cluster yet.${C_0}"
+    say "  ${C_DIM}(mirage's own commands always work regardless.)${C_0}"
+  fi
+  say ""
+}
+
+# ---- api: the Connect REST API, through the ingress ----
+#
+# With a path: GET it and print the body. Without: show how to reach it and
+# whether the path is currently up.
+#
+# Either way this (re-)establishes the port-forward if it has died, which is
+# why it is also the thing status/verify tell you to run. Auto-healing happens
+# only here and in setup -- never silently in the middle of a lab.
+cmd_api() {
+  require_cluster
+  local path="${1:-}"
+
+  if ! kubectl -n "$API_NS" get deploy "$API_SVC" >/dev/null 2>&1; then
+    err "ingress-nginx is not installed in this cluster."
+    say "  Install it:  kubectl apply -f vendor/ingress-nginx-$INGRESS_NGINX_VERSION/deploy.yaml"
+    say "  Or rebuild:  mirage setup"
+    return 1
+  fi
+  # Both objects live in manifests/ingress.yaml. Check the NetworkPolicy too:
+  # without it Strimzi's own policy blocks nginx and the only symptom is a 504
+  # (or a timeout) while every backend signal reads healthy.
+  if ! kq get ingress mirage-connect-api >/dev/null 2>&1 \
+     || ! kq get networkpolicy mirage-connect-api-from-ingress >/dev/null 2>&1; then
+    warn "The Ingress or its NetworkPolicy is missing; applying manifests/ingress.yaml"
+    kubectl apply -f "$LAB_HOME/manifests/ingress.yaml" >/dev/null 2>&1 || {
+      err "Ingress apply failed"; return 1; }
+  fi
+
+  if ! api_start; then
+    err "Could not reach the Connect REST API."
+    say ""
+    say "  Controller:  kubectl -n $API_NS get pods"
+    say "  Ingress:     kubectl -n $NS describe ingress mirage-connect-api"
+    say "  Forward log: $(api_log_file)"
+    say ""
+    # Naming the PID is the difference between a dead end and a one-line fix:
+    # the usual cause is a port-forward left over from a previous cluster, which
+    # teardown could not record because it removed .state along with the pidfile.
+    local holder; holder="$(api_port_holder)"
+    if [ -n "$holder" ]; then
+      say ""
+      say "  Port $API_PORT is held by PID ${C_B}$holder${C_0}, which is not serving this cluster."
+      say "  Free it with:  ${C_B}kill $holder${C_0}   then re-run ${C_B}mirage api${C_0}"
+    else
+      say "  ${C_DIM}Port $API_PORT may also be held by something else on this host.${C_0}"
+    fi
+    return 1
+  fi
+
+  if [ -n "$path" ]; then
+    case "$path" in /*) ;; *) path="/$path" ;; esac
+    api_curl "$path"
+    # The body may not end in a newline (Connect's JSON does not), which would
+    # otherwise glue the shell prompt onto the output.
+    printf '\n'
+    return 0
+  fi
+
+  hr; say "${C_B}Connect REST API${C_0}"; hr
+  say ""
+  say "  ${C_B}$(api_curl_example)${C_0}"
+  say ""
+  say "Or without the header:"
+  say ""
+  say "  ${C_B}mirage api /connectors${C_0}"
+  say "  ${C_B}mirage api /connectors/$CONNECTOR/status${C_0}"
+  say "  ${C_B}mirage api /connectors/$CONNECTOR/config${C_0}"
+  say "  ${C_B}mirage api /connector-plugins${C_0}"
+  say ""
+  say "  ${C_GRN}reachable${C_0} on localhost:$API_PORT ${C_DIM}(host $API_HOST)${C_0}"
+  say ""
+  say "${C_DIM}Routed by Host header through a real Ingress and ingress-nginx, the"
+  say "same shape as production. In production this API is READ-ONLY by"
+  say "convention: mutate connectors through the KafkaConnector CR, never here,"
+  say "or the operator reconciles your change away.${C_0}"
+  say ""
+}
+
+# ---- kafka: expose a broker on localhost:9092 for the host's own CLI ----
+#
+# See kafka_pf_start in lib/common.sh for why this forwards a POD and needs an
+# /etc/hosts entry: a Kafka client follows the broker's advertised listener,
+# which is internal cluster DNS.
+cmd_kafka() {
+  require_cluster
+  local side="${1:-source}"
+  case "$side" in
+    source|src)     side=source ;;
+    target|tgt)     side=target ;;
+    stop|off)       kafka_pf_stop; say "Kafka port-forward stopped."; return 0 ;;
+    both|all)
+      # Not possible without sudo, and saying so beats a forward that silently
+      # serves the wrong cluster. Tested: both brokers advertise :9092, so a
+      # second forward on :9093 bootstraps, learns the advertised :9092, and
+      # reconnects to whichever forward holds that port. Querying the TARGET on
+      # :9093 returned the SOURCE's topic list with no error at all.
+      err "Both clusters cannot be forwarded at once."
+      say ""
+      say "  Both brokers advertise port ${C_B}9092${C_0}, and a Kafka client always"
+      say "  reconnects to the advertised address. A second forward on another"
+      say "  local port bootstraps fine and then redirects to :9092 — so it"
+      say "  silently returns the OTHER cluster's data. Verified, not theory."
+      say ""
+      say "  Two real options:"
+      say "    ${C_B}mirage kafka target${C_0}   switch sides (fast — no cluster change)"
+      say "    ${C_B}sudo ifconfig lo0 alias 127.0.0.2${C_0}   then ask for a second address"
+      say ""
+      return 1 ;;
+    status)
+      local s; s="$(kafka_pf_side)"
+      if [ -z "$s" ]; then say "No Kafka port-forward is running."; return 0; fi
+      if kafka_pf_up "$s"; then
+        # Confirm the far end is the cluster the records claim, not just that
+        # something answers — a mislabelled forward is the failure this guards.
+        local sc; sc="$(kafka_pf_cluster_id)"
+        if [ -n "$sc" ] && [ "$sc" != "$(kafka_cluster_id "$s")" ]; then
+          warn "recorded as $s, but localhost:$KAFKA_PORT serves cluster id $sc"
+          say "  That is the ${C_B}other${C_0} cluster. Re-establish: ${C_B}mirage kafka $s${C_0}"
+          return 1
+        fi
+        say "Forwarding ${C_B}$s${C_0} on localhost:$KAFKA_PORT ${C_DIM}(PID $(kafka_port_holder), cluster $sc)${C_0}"
+      else
+        warn "recorded as $s on localhost:$KAFKA_PORT, but it is NOT reachable."
+        say "  Re-establish with: ${C_B}mirage kafka $s${C_0}"
+      fi
+      return 0 ;;
+    *) err "Usage: mirage kafka [source|target|stop|status]"; return 1 ;;
+  esac
+
+  local host; host="$(kafka_advertised_host "$side")"
+
+  if ! kafka_pf_start "$side"; then
+    err "Could not forward the $side broker on localhost:$KAFKA_PORT."
+    local holder; holder="$(kafka_port_holder)"
+    if [ -n "$holder" ]; then
+      say "  Port $KAFKA_PORT is held by PID ${C_B}$holder${C_0}."
+      say "  Free it with:  ${C_B}kill $holder${C_0}   then re-run ${C_B}mirage kafka $side${C_0}"
+    fi
+    say "  Forward log: $(kafka_pf_log_file)"
+    return 1
+  fi
+
+  hr; say "${C_B}Kafka CLI access — $side cluster${C_0}"; hr
+  say ""
+
+  # The hosts entry is the half that cannot be automated: /etc/hosts needs root.
+  # Without it the forward binds and then every request fails with
+  # UnknownHostException, so say so loudly rather than reporting success.
+  if ! kafka_hosts_entry_ok "$side"; then
+    warn "localhost:$KAFKA_PORT is forwarded, but your Kafka CLI will still fail."
+    say ""
+    say "  A client bootstraps, then reconnects to the name the broker advertises:"
+    say "    ${C_DIM}$host${C_0}"
+    say "  Your host cannot resolve that, so add it once (needs sudo):"
+    say ""
+    say "    ${C_B}echo '127.0.0.1 $host' | sudo tee -a /etc/hosts${C_0}"
+    say ""
+    say "  Then re-run ${C_B}mirage kafka $side${C_0}."
+    say ""
+    return 1
+  fi
+
+  # Prove it, do not assert it. `mirage kafka target` once printed
+  # "ready -> target broker" over a forward that was serving the source, which
+  # is the most expensive kind of wrong. The cluster id comes from the far end.
+  local cid
+  cid="$(kafka_pf_cluster_id)"
+  if [ -n "$cid" ] && [ "$cid" != "$(kafka_cluster_id "$side")" ]; then
+    err "localhost:$KAFKA_PORT is NOT serving the $side cluster."
+    say ""
+    say "  Expected cluster id ${C_B}$(kafka_cluster_id "$side")${C_0}, got ${C_B}$cid${C_0}."
+    say "  Something else holds the port — most likely the other cluster's forward."
+    say ""
+    local holder; holder="$(kafka_port_holder)"
+    [ -n "$holder" ] && say "  Free it with:  ${C_B}kill $holder${C_0}   then re-run ${C_B}mirage kafka $side${C_0}"
+    say ""
+    return 1
+  fi
+
+  say "  ${C_GRN}ready${C_0}   localhost:$KAFKA_PORT  ${C_DIM}-> $side broker${C_0}"
+  [ -n "$cid" ] && say "  ${C_DIM}verified: cluster id $cid${C_0}"
+  say ""
+  say "From any terminal:"
+  say ""
+  say "  ${C_B}kafka-topics --bootstrap-server localhost:$KAFKA_PORT --describe --topic $TOPIC${C_0}"
+  say "  ${C_B}kafka-topics --bootstrap-server localhost:$KAFKA_PORT --list${C_0}"
+  say "  ${C_B}kafka-console-consumer --bootstrap-server localhost:$KAFKA_PORT --topic $TOPIC --max-messages 5${C_0}"
+  say "  ${C_B}kafka-get-offsets --bootstrap-server localhost:$KAFKA_PORT --topic $TOPIC${C_0}"
+  say ""
+  say "Switch sides:  ${C_B}mirage kafka target${C_0} | ${C_B}mirage kafka source${C_0}"
+  say ""
+  # Both clusters advertise 9092, and a second loopback address needs
+  # `sudo ifconfig lo0 alias`, so only one side can hold the port at a time.
+  say "${C_DIM}Only one cluster at a time: both advertise port $KAFKA_PORT, so the forward"
+  say "switches rather than running two. Stop it with: mirage kafka stop${C_0}"
+  say ""
+  say "To hit the OTHER cluster without switching, skip the forward entirely:"
+  say "  ${C_B}mirage kcli target topics --list${C_0}"
+  say "  ${C_B}mirage kcli source topics --describe --topic $TOPIC${C_0}"
+  say ""
+}
+
+# ---- kcli: run a Kafka CLI tool against either cluster, no forward needed ----
+#
+# The port-forward can only serve one cluster (both advertise 9092), which makes
+# "check the other side" needlessly disruptive. This execs the broker's own CLI
+# inside the pod instead, so BOTH clusters are reachable at once and the
+# advertised-listener problem does not arise at all.
+#
+# Usage: mirage kcli <source|target> <tool> [args...]
+#   tool is a bin/kafka-<tool>.sh name without the prefix/suffix:
+#     topics, get-offsets, configs, console-consumer, consumer-groups, ...
+# --bootstrap-server is supplied automatically; passing one is an error, because
+# a wrong value silently queries the wrong cluster.
+cmd_kcli() {
+  require_cluster
+  local side="${1:-}" tool="${2:-}"
+  case "$side" in
+    source|src) side=source ;;
+    target|tgt) side=target ;;
+    *) err "Usage: mirage kcli <source|target> <tool> [args...]"
+       say ""
+       say "  ${C_B}mirage kcli target topics --list${C_0}"
+       say "  ${C_B}mirage kcli source topics --describe --topic $TOPIC${C_0}"
+       say "  ${C_B}mirage kcli target get-offsets --topic $TOPIC${C_0}"
+       say ""
+       say "  ${C_DIM}Runs the broker's own CLI in the pod, so both clusters are"
+       say "  reachable at once — no port-forward and no switching.${C_0}"
+       return 1 ;;
+  esac
+  [ -z "$tool" ] && { err "Which tool? e.g. 'topics', 'get-offsets', 'configs'"; return 1; }
+  shift 2
+
+  local pod boot
+  if [ "$side" = "source" ]; then pod="$(src_pod)"; boot="$SRC_BOOT"
+  else                            pod="$(tgt_pod)"; boot="$TGT_BOOT"
+  fi
+  [ -z "$pod" ] && { err "No $side broker pod found."; return 1; }
+
+  # Refuse a caller-supplied bootstrap: the whole point is that the right one is
+  # chosen for you, and a stale --bootstrap-server is how you end up reading the
+  # other cluster and believing the result.
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --bootstrap-server*)
+        err "Do not pass --bootstrap-server; 'kcli $side' already targets $boot."
+        return 1 ;;
+    esac
+  done
+
+  # Refuse the one delete that wrecks the environment.
+  #
+  # Deleting the SOURCE lab-orders is not recoverable by the obvious means. The
+  # KafkaTopic operator does NOT recreate it (tested: still absent after 60s),
+  # `mirage reset --fresh` then reports "replication is NOT working", and the
+  # worker can be left crashlooping. Recreating it by hand also risks the wrong
+  # partition count — 12 is load-bearing for lab 1, and a 1-partition adoption
+  # breaks labs silently. truncate_topic exists to do this correctly.
+  if [ "$side" = "source" ] && [ "$tool" = "topics" ]; then
+    local arg has_delete=0 names_topic=0
+    for arg in "$@"; do
+      case "$arg" in
+        --delete) has_delete=1 ;;
+        "$TOPIC") names_topic=1 ;;
+      esac
+    done
+    if [ "$has_delete" = "1" ] && [ "$names_topic" = "1" ]; then
+      err "Refusing to delete $TOPIC on the source cluster."
+      say ""
+      say "  It is managed by a KafkaTopic CR, and the operator does not bring it"
+      say "  back — replication stops and the Connect worker can end up"
+      say "  crashlooping. Recreating it by hand also risks the wrong partition"
+      say "  count; ${C_B}12${C_0} is load-bearing for lab 1."
+      say ""
+      say "  To empty and rebuild it correctly:  ${C_B}mirage reset --fresh${C_0}"
+      say ""
+      return 1
+    fi
+  fi
+
+  # Header on stderr so stdout pipes cleanly:
+  #   for t in $(mirage kcli target topics --list | grep mm2); do ...
+  say "${C_DIM}# $side cluster ($boot)${C_0}" >&2
+  kq exec "$pod" -c kafka -- "bin/kafka-$tool.sh" --bootstrap-server "$boot" "$@"
+}
+
+# ---- intro: a guided first run so lab 1 is not a cold start ----
+cmd_intro() {
+  hr; say "${C_B}How these labs work${C_0}"; hr
+  cat <<'EOF'
+
+Each lab breaks something in a running Kafka Connect mirror, then grades whether
+you fixed it. Nothing is simulated: there are two real Kafka clusters, a real
+Strimzi-managed Connect worker, and a real MirrorSourceConnector between them.
+
+RAW kubectl NEEDS THE LAB KUBECONFIG
+
+  Every mirage command sets it for you. Raw kubectl does not, so it talks to
+  whatever your shell points at — and you will see "No resources found":
+
+    eval "$(./mirage env --export)"
+
+  The namespace is pinned to mirage inside that kubeconfig, so you do not need
+  -n mirage either. The pinning is deliberate: it is what stops a lab touching a
+  real cluster.
+
+THE LOOP
+
+  mirage start 1     inject the fault and print the symptom
+  ...                 diagnose and fix it with kubectl
+  mirage stop 1      grade your fix
+
+WHAT YOU GET WHEN YOU ARE STUCK
+
+  mirage diff        baseline vs running state, and CR vs worker runtime.
+                      Start here. It is the on-call reflex worth building.
+  mirage status      pods, CRs, task states at a glance
+  mirage counts      is data actually moving? (measures a live delta)
+  mirage logs -e     only the log lines that matter, with what they mean
+  mirage hint 1      one nudge. Run it again for the next one.
+  mirage solve 1     the full answer, once you want it
+
+IF THE ENVIRONMENT ITSELF LOOKS BROKEN
+
+  mirage verify      16 checks that separate "my fix is wrong" from
+                      "the cluster is unhappy"
+  mirage reset       put the baseline back
+  mirage repair      rebuild Connect when things are properly wedged
+
+TWO THINGS THAT WILL SAVE YOU TIME
+
+  1. A grade that fails only on throughput is often just slow recovery. A
+     connector coming back from UNASSIGNED can take ~2 minutes. Wait, then
+     re-run stop before assuming the fix was wrong.
+
+  2. Green task state is not a working pipeline. Several labs leave every task
+     RUNNING while no data moves at all — that is the point of them. Always
+     confirm with mirage counts.
+
+EOF
+  say "Ready: ${C_B}mirage start 1${C_0}   ${C_DIM}(or mirage list to see all 19)${C_0}"
+  say ""
+}
+
+cmd_metrics() {
+  require_cluster
+  local pat="${1:-kafka_connect_worker_connector|kafka_connect_connector_status|rebalance_epoch|records_lag_max}"
+  local out
+  out="$(metric "$pat")"
+  if [ -z "$out" ]; then
+    warn "No metrics matched '$pat' (worker may still be starting)"
+  else
+    printf '%s\n' "$out"
+  fi
+}
+
+cmd_answer() {
+  local n="${1:-}" v="${2:-}"
+  [ -z "$n" ] || [ -z "$v" ] && { err "Usage: mirage answer <lab> <value>"; exit 1; }
+  mark "lab${n}.answer" "$v"
+  say "Recorded answer for lab $n: ${C_B}$v${C_0}"
+}
+
+# -------------------------------------------------------------------- reset
+
+cmd_reset() {
+  local quiet="" fresh=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      quiet)            quiet=quiet ;;
+      --fresh|fresh)    fresh=1 ;;
+    esac
+    shift
+  done
+  require_cluster
+  [ "$quiet" != "quiet" ] && info "Restoring the baseline"
+
+  if [ -n "$fresh" ]; then
+    info "Truncating $TOPIC (dropping accumulated records)"
+    truncate_topic
+  fi
+
+  k delete resourcequota mirage-quota >/dev/null 2>&1 || true
+
+  # Undo lab 8's broker severing (impossible node affinity on the source pool).
+  k patch kafkanodepool source-pool --type json \
+    -p '[{"op":"remove","path":"/spec/template/pod/affinity"}]' >/dev/null 2>&1 || true
+  k patch kafkanodepool source-pool --type merge -p '{"spec":{"replicas":1}}' >/dev/null 2>&1 || true
+  k patch kafkanodepool target-pool --type merge -p '{"spec":{"replicas":1}}' >/dev/null 2>&1 || true
+  forget_broker_pods
+
+  # Undo lab 7/12's loopback connectors and any renamed survivors.
+  k delete kafkaconnector lab-loopback lab-stray lab-orders-renamed \
+    lab-orders-recovered >/dev/null 2>&1 || true
+
+  # Lab 3/12 may leave the worker sized so it cannot start; restore_baseline
+  # reapplies the manifest, which fixes that.
+  restore_baseline
+  clean_replicated_junk
+  clear_active
+  # No lab is active, so no log window applies; the next `start` sets a new one.
+  log_epoch_clear
+
+  # Verify, and self-heal once if the baseline is genuinely dead. Reporting
+  # "restored" while nothing replicates is worse than reporting failure.
+  local healthy=0 attempt
+  for attempt in 1 2; do
+    if settle_connector 180 && [ "$(replication_delta 600 90)" -ge 400 ]; then
+      healthy=1; break
+    fi
+    [ "$attempt" -eq 2 ] && break
+    warn "Baseline is not replicating — recreating the Connect cluster"
+    recreate_connect_cluster
+    restore_baseline
+  done
+
+  if [ "$quiet" != "quiet" ]; then
+    say ""
+    cmd_counts
+    say ""
+    if [ "$healthy" -eq 1 ]; then
+      say "${C_GRN}Baseline restored and replicating.${C_0} ${C_B}mirage next${C_0}"
+    else
+      err "Baseline restored but replication is NOT working."
+      say "  Diagnose with: ${C_B}mirage verify${C_0}"
+      say "  If that fails too: ${C_B}mirage teardown && mirage setup${C_0}"
+      return 1
+    fi
+  fi
+  [ "$healthy" -eq 1 ] || return 1
+  return 0
+}
+
+cmd_repair() {
+  require_cluster
+  hr; say "${C_B}Repairing the Connect cluster${C_0}"; hr
+  say "Use this when the environment is wedged: no Connect pod, a worker stuck"
+  say "with zero tasks, or replication dead after a lab. Rebuilds the Connect"
+  say "cluster and its internal topics from scratch. Kafka data is untouched."
+  say ""
+
+  k delete resourcequota mirage-quota >/dev/null 2>&1 || true
+  k patch kafkanodepool source-pool --type json \
+    -p '[{"op":"remove","path":"/spec/template/pod/affinity"}]' >/dev/null 2>&1 || true
+  forget_broker_pods
+
+  info "Recreating the Connect cluster (up to 7 minutes)"
+  recreate_connect_cluster
+
+  info "Restoring the baseline connector"
+  restore_baseline
+  clean_replicated_junk
+  clear_active
+
+  # recreate_connect_cluster deletes the KafkaConnect CR, so Strimzi deletes and
+  # recreates the connect-api Service under the Ingress. The Ingress itself
+  # survives (it binds by name), but nginx's endpoints churn and the forward may
+  # have been serving across the gap -- re-establish it.
+  #
+  # Before the success/failure branch deliberately: the failure path sends you to
+  # `mirage verify`, which reports REST API reachability, so the forward has to
+  # be back up in BOTH outcomes.
+  api_start >/dev/null 2>&1 || warn "REST API not reachable after repair; run: mirage api"
+  # Re-establish the Kafka forward too: repair replaces pods, which drops it.
+  kafka_pf_start "$(kafka_pf_side)" >/dev/null 2>&1 || true
+
+  if settle_connector 180 && [ "$(replication_delta 600 90)" -ge 400 ]; then
+    say ""
+    say "${C_GRN}${C_B}  Repaired and replicating.  ${C_0}"
+    cmd_counts
+    return 0
+  fi
+
+  say ""
+  err "Repair did not restore replication."
+  say "  Run ${C_B}mirage verify${C_0} to see which layer is broken,"
+  say "  or rebuild from scratch: ${C_B}mirage teardown && mirage setup${C_0}"
+  return 1
+}
+
+cmd_teardown() {
+  local provider
+  provider="$(provider_saved || provider_detect)" || {
+    err "Cannot tell which provider owns this cluster, and no provider is installed."
+    exit 1; }
+  say "This deletes the $provider cluster '$LAB_CLUSTER' and everything in it."
+  printf 'Type %sdelete%s to confirm: ' "$C_B" "$C_0"
+  local reply; read -r reply
+  if [ "$reply" != "delete" ]; then say "Aborted."; exit 0; fi
+  # Kill the port-forwards before the cluster goes: kubectl would otherwise be
+  # left retrying against an API server that no longer exists. Both must go, or
+  # the survivor holds its port against a namespace that no longer exists --
+  # which is the orphan case kafka_pf_stop_orphan then has to clean up.
+  api_stop
+  kafka_pf_stop
+  provider_delete "$provider"
+  rm -rf "$STATE_DIR"
+  say "Gone."
+}
+
+# --------------------------------------------------------------------- usage
+
+cmd_help() {
+cat <<EOF
+mirage — Kafka Connect incident trainer (KCD / Strimzi)
+
+  ${C_B}setup${C_0}              create cluster + Strimzi + Kafka + Connect + ingress
+  ${C_B}list${C_0}               list labs and your results
+  ${C_B}start <n>${C_0}          inject lab n's fault(s)
+  ${C_B}stop [n]${C_0}           grade your fix (defaults to the active lab)
+  ${C_B}hint [n] [level]${C_0}   a nudge, one step at a time (run again for more)
+  ${C_B}solve [n]${C_0}          the full answer
+  ${C_B}why [n]${C_0}            debrief: the mechanism, the signal, the rule
+  ${C_B}answer <n> <v>${C_0}     record a triage conclusion (e.g. answer 8 broker)
+  ${C_B}next${C_0}               show the next lab in the recommended order
+
+  ${C_B}status${C_0}             cluster + lab overview
+  ${C_B}verify${C_0}             health-check the whole environment end to end
+  ${C_B}counts${C_0}             source vs target counts, plus a live replication delta
+  ${C_B}diff${C_0}               baseline vs running state, and CR vs worker runtime
+  ${C_B}intro${C_0}              how the labs work — read this first
+  ${C_B}env${C_0}                print the KUBECONFIG line for raw kubectl
+  ${C_B}api [path]${C_0}         Connect REST API through the ingress (e.g. api /connectors)
+  ${C_B}kafka [side]${C_0}       expose a broker on localhost:9092 for your own kafka-* CLI
+                     ${C_DIM}source (default) | target | stop | status${C_0}
+  ${C_B}kcli <side> <tool>${C_0} run a Kafka CLI tool against either cluster, no forward
+                     ${C_DIM}e.g. kcli target topics --list${C_0}
+  ${C_B}topics${C_0}             topics on both clusters
+  ${C_B}logs [lines]${C_0}       tail a Connect worker
+  ${C_B}logs --errors${C_0}      only known failure signatures, with what they mean
+  ${C_B}metrics [pattern]${C_0}  scrape the JMX exporter on :9404
+
+  ${C_B}reset [--fresh]${C_0}     restore the baseline; --fresh also empties the topic
+  ${C_B}repair${C_0}             rebuild the Connect cluster when the environment is wedged
+  ${C_B}teardown${C_0}           delete the cluster
+
+Cluster provider: kind by default, minikube also supported.
+  MIRAGE_PROVIDER=minikube mirage setup
+
+Typical session:
+  mirage setup
+  mirage start 1
+  ... investigate and fix with kubectl ...
+  mirage stop 1
+EOF
+}
+
+# ----------------------------------------------------------------- dispatch
+
+case "${1:-help}" in
+  setup)    shift; cmd_setup "$@" ;;
+  list|ls)  shift; cmd_list "$@" ;;
+  start)    shift; cmd_start "$@" ;;
+  stop)     shift; cmd_stop "$@" ;;
+  hint)     shift; cmd_hint "$@" ;;
+  solve)    shift; cmd_solve "$@" ;;
+  answer)   shift; cmd_answer "$@" ;;
+  status)   shift; cmd_status "$@" ;;
+  verify)   shift; cmd_verify "$@" ;;
+  next)     shift; cmd_next "$@" ;;
+  counts)   shift; cmd_counts "$@" ;;
+  diff)     shift; cmd_diff "$@" ;;
+  intro)    shift; cmd_intro "$@" ;;
+  env)      shift; cmd_env "$@" ;;
+  api)      shift; cmd_api "$@" ;;
+  kafka)    shift; cmd_kafka "$@" ;;
+  kcli)     shift; cmd_kcli "$@" ;;
+  why)      shift; cmd_why "$@" ;;
+  topics)   shift; cmd_topics "$@" ;;
+  logs)     shift; cmd_logs "$@" ;;
+  metrics)  shift; cmd_metrics "$@" ;;
+  reset)    shift; cmd_reset "$@" ;;
+  repair)   shift; cmd_repair "$@" ;;
+  teardown) shift; cmd_teardown "$@" ;;
+  help|-h|--help) cmd_help ;;
+  *) err "Unknown command: $1"; say ""; cmd_help; exit 1 ;;
+esac

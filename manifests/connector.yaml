@@ -1,0 +1,52 @@
+---
+# Modelled on real mirror_connector_template.j2 output.
+# This is the known-good baseline every lab breaks and you repair.
+apiVersion: kafka.strimzi.io/v1beta2
+kind: KafkaConnector
+metadata:
+  name: lab-orders-from-source-to-target
+  namespace: mirage
+  labels:
+    strimzi.io/cluster: mirage
+  annotations:
+    # Preserves the underscore form, as production does.
+    mirageduel.com/connector-name: lab_orders_from_source_to_target
+spec:
+  class: org.apache.kafka.connect.mirror.MirrorSourceConnector
+  tasksMax: 4
+  autoRestart:
+    enabled: true
+    maxRestarts: 5
+  config:
+    topics: "lab-orders"
+    replication.factor: "1"
+
+    clusters: "source,target"
+    source.cluster.alias: source
+    target.cluster.alias: target
+    source.cluster.bootstrap.servers: kafka-source-kafka-bootstrap:9092
+    target.cluster.bootstrap.servers: kafka-target-kafka-bootstrap:9092
+    producer.override.bootstrap.servers: kafka-target-kafka-bootstrap:9092
+
+    replication.policy.class: org.apache.kafka.connect.mirror.IdentityReplicationPolicy
+
+    key.converter: org.apache.kafka.connect.converters.ByteArrayConverter
+    value.converter: org.apache.kafka.connect.converters.ByteArrayConverter
+    header.converter: org.apache.kafka.connect.converters.ByteArrayConverter
+
+    emit.heartbeats.interval.seconds: "1"
+    emit.checkpoints.interval.seconds: "1"
+    heartbeats.topic.replication.factor: "1"
+    heartbeats.replication.enabled: "false"
+
+    refresh.topics.enabled: "true"
+    refresh.topics.interval.seconds: "10"
+    sync.topic.configs.enabled: "false"
+    sync.topic.acls.enabled: "false"
+
+    connector.client.config.override.policy: All
+
+    # Loop guard: blocks heartbeats, mm2 internals, .replica and __* topics.
+    topics.exclude: ".*\\.heartbeats, mm2.*\\.internal, .*\\.replica, __.*"
+
+    consumer.auto.offset.reset: "latest"
