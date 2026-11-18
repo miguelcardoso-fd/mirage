@@ -1,6 +1,6 @@
-# KCD Incident-Response Labs
+# Mirage — Kafka Connect Incident-Response Labs
 
-A local trainer for KCD / Strimzi Kafka Connect on-call. Each lab **breaks
+A local trainer for Strimzi Kafka Connect on-call. Each lab **breaks
 something**, you **fix it with `kubectl`**, and `mirage stop` **grades you** —
 pass, or a list of exactly where you fell short and why it matters.
 

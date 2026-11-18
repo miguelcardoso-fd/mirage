@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# mirage — local Kafka Connect incident-response trainer (KCD / Strimzi).
+# mirage — local Kafka Connect incident-response trainer (Strimzi).
 #
 #   mirage setup          create the cluster + Strimzi + Kafka + Connect + ingress
 #   mirage list           show all labs and your results
@@ -1693,7 +1693,7 @@ cmd_teardown() {
 
 cmd_help() {
 cat <<EOF
-mirage — Kafka Connect incident trainer (KCD / Strimzi)
+mirage — Kafka Connect incident trainer (Strimzi)
 
   ${C_B}setup${C_0}              create cluster + Strimzi + Kafka + Connect + ingress
   ${C_B}list${C_0}               list labs and your results
